@@ -1,0 +1,14 @@
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.pyc
+.env
+.pytest_cache
+.ruff_cache
+.mypy_cache
+*.md
+infra/k8s
+infra/terraform
+loadtests
