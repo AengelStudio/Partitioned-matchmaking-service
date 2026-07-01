@@ -5,6 +5,7 @@ import time
 from app.config import Settings, get_settings
 from app.db.connection import close_pool, get_pool
 from app.worker import leases, matching
+from app.worker.http import start_metrics_server
 from app.worker.metrics import WorkerMetrics
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,18 @@ def run_loop(
                 conn.rollback()
 
 
+def shutdown_worker(worker_id: str) -> None:
+    try:
+        pool = get_pool()
+        with pool.connection() as conn:
+            leases.release_owned_partitions(conn, worker_id)
+            conn.commit()
+    except Exception:
+        logger.exception("worker_shutdown_release_failed worker_id=%s", worker_id)
+    finally:
+        close_pool()
+
+
 def main() -> None:
     settings = get_settings()
     logging.basicConfig(
@@ -74,6 +87,13 @@ def main() -> None:
 
     logger.info("worker_started worker_id=%s", worker_id)
     get_pool()
+    start_metrics_server(
+        settings.worker_metrics_host,
+        settings.worker_metrics_port,
+        metrics,
+        worker_id,
+        settings.metrics_enabled,
+    )
 
     try:
         while True:
@@ -86,11 +106,14 @@ def main() -> None:
             metrics.record_loop((time.perf_counter() - loop_start) * 1000.0)
 
             if settings.metrics_enabled and metrics.loops_completed % 10 == 0:
-                logger.info("worker_metrics %s", metrics.format_prometheus().strip())
+                logger.info(
+                    "worker_metrics %s",
+                    metrics.format_prometheus(worker_id).strip(),
+                )
 
             time.sleep(interval)
     finally:
-        close_pool()
+        shutdown_worker(worker_id)
 
 
 if __name__ == "__main__":

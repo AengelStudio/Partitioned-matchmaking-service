@@ -45,6 +45,20 @@ def claim_available_partitions(
         return [row[0] for row in cur.fetchall()]
 
 
+def release_owned_partitions(conn: Connection, worker_id: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE partition_leases
+            SET owned_by = NULL,
+                lease_until = NULL,
+                updated_at = now()
+            WHERE owned_by = %s
+            """,
+            (worker_id,),
+        )
+
+
 def list_owned_partitions(conn: Connection, worker_id: str) -> list[int]:
     with conn.cursor() as cur:
         cur.execute(
