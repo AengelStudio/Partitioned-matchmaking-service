@@ -6,9 +6,10 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 COPY pyproject.toml ./
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir ".[dev]"
 
 COPY app/ app/
+COPY tests/ tests/
 
 EXPOSE 8080
 
