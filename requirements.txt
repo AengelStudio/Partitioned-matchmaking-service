@@ -1,5 +1,11 @@
 fastapi
 uvicorn[standard]
 asyncpg
-redis
+sqlalchemy[asyncio]
+redis[asyncio]
+pydantic
 pydantic-settings
+pytest
+pytest-asyncio
+httpx
+python-dotenv
