@@ -1,6 +1,6 @@
-import asyncpg
-from app.core.config import settings
+# placeholder until Phase 2
+async def init_db():
+    print("PostgreSQL: connected (stub)")
 
-
-async def get_connection() -> asyncpg.Connection:
-    return await asyncpg.connect(settings.DATABASE_URL)
+async def close_db():
+    print("PostgreSQL: disconnected (stub)")
