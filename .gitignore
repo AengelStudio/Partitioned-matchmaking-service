@@ -216,6 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+.streamlit/secrets.toml
 
 # Section B local Cursor rules (not shared in repo)
 section-b/
