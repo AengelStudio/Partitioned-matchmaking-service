@@ -1,3 +1,11 @@
+CREATE TABLE IF NOT EXISTS tenants (
+    tenant_id              TEXT        PRIMARY KEY,
+    max_tickets_in_flight  INT         NOT NULL DEFAULT 1000,
+    max_tickets_per_second INT         NOT NULL DEFAULT 100,
+    callback_url           TEXT,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS tickets (
     ticket_id    UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     player_id    TEXT        NOT NULL,
@@ -33,3 +41,9 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (key, tenant_id)
 );
+
+INSERT INTO tenants (tenant_id, max_tickets_in_flight, max_tickets_per_second, callback_url)
+VALUES
+  ('tenant-1', 1000, 100, 'http://localhost:9000/callback/tenant-1'),
+  ('tenant-2', 500, 50, 'http://localhost:9000/callback/tenant-2')
+ON CONFLICT DO NOTHING;
