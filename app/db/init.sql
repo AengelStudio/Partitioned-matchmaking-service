@@ -24,3 +24,12 @@ CREATE TABLE IF NOT EXISTS match_players (
     player_id TEXT NOT NULL,
     PRIMARY KEY (match_id, player_id)
 );
+
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+    key            TEXT        NOT NULL,
+    tenant_id      TEXT        NOT NULL,
+    request_hash   TEXT        NOT NULL,
+    response_body  JSONB       NOT NULL,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (key, tenant_id)
+);
