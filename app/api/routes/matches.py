@@ -1,12 +1,13 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from app.db.postgres import get_pool
+from app.core.tenants import require_tenant
 from app.models.schemas import MatchResponse
 
 router = APIRouter()
 
 
 @router.get("/matches/{match_id}", response_model=MatchResponse)
-async def get_match(match_id: str):
+async def get_match(match_id: str, tenant: dict = Depends(require_tenant)):
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(

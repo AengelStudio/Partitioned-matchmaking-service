@@ -1,5 +1,5 @@
 import hashlib
-from fastapi import APIRouter, Header, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from app.db.postgres import get_pool
 from app.core.config import settings
@@ -8,6 +8,7 @@ from app.core.idempotency import (
     compute_request_hash,
     store_idempotency_key,
 )
+from app.core.tenants import require_tenant
 from app.models.schemas import TicketRequest, TicketResponse
 
 router = APIRouter()
@@ -17,12 +18,9 @@ router = APIRouter()
 async def create_ticket(
     request: Request,
     body: TicketRequest,
-    x_tenant_id: str | None = Header(None),
+    tenant: dict = Depends(require_tenant),
     idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
 ):
-    if x_tenant_id is None:
-        raise HTTPException(status_code=400, detail="X-Tenant-Id header is required")
-
     pool = get_pool()
     request_hash = None
 
@@ -66,7 +64,7 @@ async def create_ticket(
 
 
 @router.get("/tickets/{ticket_id}", response_model=TicketResponse)
-async def get_ticket(ticket_id: str):
+async def get_ticket(ticket_id: str, tenant: dict = Depends(require_tenant)):
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -78,7 +76,7 @@ async def get_ticket(ticket_id: str):
 
 
 @router.delete("/tickets/{ticket_id}", status_code=204)
-async def cancel_ticket(ticket_id: str):
+async def cancel_ticket(ticket_id: str, tenant: dict = Depends(require_tenant)):
     pool = get_pool()
     async with pool.acquire() as conn:
         result = await conn.execute(
