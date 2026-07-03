@@ -25,6 +25,8 @@ class Settings(BaseSettings):
     db_latency_shed_threshold_ms: int = 200
 
     worker_id: str = "worker-local-1"
+    worker_metrics_host: str = "0.0.0.0"
+    worker_metrics_port: int = 9090
     worker_lease_seconds: int = 15
     worker_loop_interval_ms: int = 500
     worker_partition_batch_size: int = 8

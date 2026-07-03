@@ -399,7 +399,36 @@ Any non-2xx response should trigger retry with backoff and jitter.
 
 ---
 
-# 5. Environment variables
+# 5. Worker HTTP endpoints
+
+The matchmaking worker exposes observability endpoints on `WORKER_METRICS_HOST` / `WORKER_METRICS_PORT` (default `9090`).
+
+## `GET /health`
+
+```json
+{
+  "status": "ok",
+  "service": "worker",
+  "worker_id": "worker-local-1"
+}
+```
+
+## `GET /metrics`
+
+Prometheus-style plain text counters:
+
+```text
+pms_worker_info{worker_id="worker-local-1"} 1
+pms_worker_matches_created_total{worker_id="worker-local-1"} 12
+pms_worker_leases_claimed_total{worker_id="worker-local-1"} 40
+pms_worker_reservations_expired_total{worker_id="worker-local-1"} 0
+pms_worker_loop_duration_ms{worker_id="worker-local-1"} 4.10
+pms_worker_loops_completed_total{worker_id="worker-local-1"} 260
+```
+
+---
+
+# 6. Environment variables
 
 ```env
 APP_NAME=pms
@@ -421,6 +450,8 @@ LOAD_SHEDDING_ENABLED=true
 DB_LATENCY_SHED_THRESHOLD_MS=200
 
 WORKER_ID=worker-local-1
+WORKER_METRICS_HOST=0.0.0.0
+WORKER_METRICS_PORT=9090
 WORKER_LEASE_SECONDS=15
 WORKER_LOOP_INTERVAL_MS=500
 WORKER_PARTITION_BATCH_SIZE=8
@@ -459,7 +490,7 @@ env:
 
 ---
 
-# 6. Docker / Compose commands
+# 7. Docker / Compose commands
 
 One shared Docker image is used for the API, matchmaking worker, callback dispatcher, and migration job. Each container runs a different command from the same image.
 
@@ -548,9 +579,12 @@ docker run --rm \
   --name pms-worker \
   --network pms-net \
   --env-file .env \
+  -p 9090:9090 \
   pms:local \
   python -m app.worker.main
 ```
+
+Worker metrics are available at `http://<worker-host>:9090/metrics` inside the Docker network (`http://worker:9090/metrics` in Compose). Publish `-p 9090:9090` when running a single worker locally; omit the port mapping when scaling workers in Compose.
 
 ## Run callback dispatcher manually
 

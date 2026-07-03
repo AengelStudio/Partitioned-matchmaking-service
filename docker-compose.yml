@@ -47,11 +47,13 @@ services:
 
   worker:
     build: .
-    command: python -m app.worker.main
+    command: ["sh", "-c", "WORKER_ID=$$(hostname) python -m app.worker.main"]
     env_file: .env
     depends_on:
       migrate:
         condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
 
   callback-dispatcher:
     build: .
