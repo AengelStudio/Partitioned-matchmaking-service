@@ -32,6 +32,12 @@ class MatchPlayer(BaseModel):
     ticket_id: UUID
 
 
+class TicketCancelResponse(BaseModel):
+    ticket_id: UUID
+    status: str
+    cancelled_at: datetime
+
+
 class MatchResponse(BaseModel):
     match_id: UUID
     tenant_id: str
