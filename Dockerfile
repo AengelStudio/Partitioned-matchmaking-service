@@ -14,4 +14,4 @@ COPY tests/ tests/
 EXPOSE 8080
 
 # Default command; overridden per service in docker-compose.yml.
-CMD ["uvicorn", "app.api.main:app", "--host", "0.0.0.0", "--port", "8080", "--log-level", "error", "--no-access-log"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--log-level", "error", "--no-access-log"]
