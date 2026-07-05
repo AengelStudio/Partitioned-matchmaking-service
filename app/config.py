@@ -38,6 +38,8 @@ class Settings(BaseSettings):
     skill_delta_after_60s: int = 400
 
     callback_dispatcher_id: str = "callback-local-1"
+    callback_metrics_host: str = "0.0.0.0"
+    callback_metrics_port: int = 9091
     callback_batch_size: int = 50
     callback_timeout_seconds: int = 3
     callback_max_attempts: int = 5
