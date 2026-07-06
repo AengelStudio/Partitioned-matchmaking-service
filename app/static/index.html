@@ -1,0 +1,647 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Matchmaking API Dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel-alt: #1c2129;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --text-dim: #8b949e;
+    --accent: #58a6ff;
+    --accent-dim: #1f6feb;
+    --red: #f85149;
+    --red-bg: rgba(248, 81, 73, 0.12);
+    --green: #3fb950;
+    --green-bg: rgba(63, 185, 80, 0.14);
+    --yellow: #d29922;
+    --yellow-bg: rgba(210, 153, 34, 0.14);
+    --grey: #8b949e;
+    --grey-bg: rgba(139, 148, 158, 0.14);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    padding: 24px 32px 64px;
+  }
+
+  .mono {
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  }
+
+  h1, h2, h3 { margin: 0; font-weight: 600; }
+
+  header.app-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding-bottom: 18px;
+    margin-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  header.app-header h1 {
+    font-size: 20px;
+    letter-spacing: 0.2px;
+  }
+
+  .header-controls {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+  }
+
+  .control-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .control-group label {
+    color: var(--text-dim);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  select, input[type="text"], input[type="number"] {
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 7px 10px;
+    font-size: 13px;
+    font-family: inherit;
+    outline: none;
+  }
+
+  select:focus, input:focus {
+    border-color: var(--accent-dim);
+  }
+
+  .health-indicator {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    font-size: 13px;
+  }
+
+  .health-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--grey);
+    display: inline-block;
+    flex-shrink: 0;
+  }
+  .dot.ok { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .dot.bad { background: var(--red); box-shadow: 0 0 6px var(--red); }
+  .dot.pending { background: var(--grey); }
+
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    align-items: start;
+  }
+
+  .full-width { grid-column: 1 / -1; }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px 22px;
+    margin-bottom: 20px;
+  }
+
+  .card h2 {
+    font-size: 15px;
+    margin-bottom: 16px;
+    color: var(--text);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .card h2 .card-subtitle {
+    font-weight: 400;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+
+  .field {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    margin-bottom: 12px;
+  }
+
+  .field label {
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+
+  .field-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+
+  .lookup-row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+  .lookup-row input { flex: 1; }
+
+  button {
+    background: var(--accent-dim);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 16px;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    font-family: inherit;
+    transition: background 0.12s ease;
+  }
+  button:hover { background: #388bfd; }
+  button:disabled { background: #30363d; color: var(--text-dim); cursor: default; }
+
+  button.btn-secondary {
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    color: var(--text);
+  }
+  button.btn-secondary:hover { background: #21262d; }
+
+  button.btn-small {
+    padding: 4px 10px;
+    font-size: 12px;
+    border-radius: 5px;
+  }
+
+  button.btn-danger {
+    background: transparent;
+    border: 1px solid rgba(248, 81, 73, 0.4);
+    color: var(--red);
+  }
+  button.btn-danger:hover { background: var(--red-bg); }
+
+  .result-panel {
+    margin-top: 14px;
+    border-top: 1px solid var(--border);
+    padding-top: 14px;
+    min-height: 20px;
+  }
+
+  .result-panel:empty { display: none; }
+
+  .result-block {
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+  }
+
+  .result-row {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    padding: 3px 0;
+  }
+
+  .result-row .label {
+    color: var(--text-dim);
+    font-size: 12px;
+    min-width: 110px;
+    flex-shrink: 0;
+  }
+
+  .result-row.players {
+    align-items: flex-start;
+  }
+
+  .player-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .chip {
+    background: rgba(88, 166, 255, 0.12);
+    border: 1px solid rgba(88, 166, 255, 0.3);
+    color: var(--accent);
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-family: "SFMono-Regular", Consolas, monospace;
+  }
+
+  .muted { color: var(--text-dim); font-size: 13px; }
+
+  .error-box {
+    background: var(--red-bg);
+    border: 1px solid rgba(248, 81, 73, 0.4);
+    border-radius: 8px;
+    padding: 10px 14px;
+    color: var(--red);
+    font-size: 13px;
+  }
+  .error-box .error-status {
+    font-weight: 700;
+    margin-right: 8px;
+  }
+
+  .badge {
+    display: inline-block;
+    padding: 2px 9px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+  }
+  .badge-waiting { background: var(--yellow-bg); color: var(--yellow); }
+  .badge-matched { background: var(--green-bg); color: var(--green); }
+  .badge-cancelled { background: var(--grey-bg); color: var(--grey); }
+  .badge-default { background: rgba(88, 166, 255, 0.14); color: var(--accent); }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+
+  th {
+    text-align: left;
+    color: var(--text-dim);
+    font-weight: 500;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  td {
+    padding: 9px 10px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  tbody tr:hover { background: var(--panel-alt); }
+  tbody tr:last-child td { border-bottom: none; }
+
+  .table-header-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 16px;
+  }
+
+  .table-wrap { overflow-x: auto; }
+</style>
+</head>
+<body>
+
+<header class="app-header">
+  <h1>Matchmaking API Dashboard</h1>
+  <div class="header-controls">
+    <div class="health-indicator" id="healthIndicator">
+      <div class="health-item"><span class="dot pending" id="dotPostgres"></span><span>postgres</span></div>
+      <div class="health-item"><span class="dot pending" id="dotRedis"></span><span>redis</span></div>
+    </div>
+    <div class="control-group">
+      <label for="tenantSelect">Tenant</label>
+      <select id="tenantSelect" onchange="onTenantChange()">
+        <option value="tenant-1">tenant-1</option>
+        <option value="tenant-2">tenant-2</option>
+      </select>
+    </div>
+  </div>
+</header>
+
+<div class="grid">
+
+  <!-- Create Ticket -->
+  <div class="card">
+    <h2>Create Ticket</h2>
+    <div class="field-row">
+      <div class="field">
+        <label for="playerIdInput">player_id</label>
+        <input type="text" id="playerIdInput" placeholder="player-123">
+      </div>
+      <div class="field">
+        <label for="regionInput">region</label>
+        <input type="text" id="regionInput" placeholder="us-east">
+      </div>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label for="queueNameInput">queue_name</label>
+        <input type="text" id="queueNameInput" placeholder="ranked-solo">
+      </div>
+      <div class="field">
+        <label for="skillRatingInput">skill_rating</label>
+        <input type="number" id="skillRatingInput" placeholder="1500" step="any">
+      </div>
+    </div>
+    <div class="field">
+      <label for="idempotencyKeyInput">Idempotency-Key (optional)</label>
+      <input type="text" id="idempotencyKeyInput" placeholder="client-generated key">
+    </div>
+    <button onclick="createTicket()" id="createTicketBtn">Create Ticket</button>
+    <div class="result-panel" id="createTicketResult"></div>
+  </div>
+
+  <!-- Lookup -->
+  <div class="card">
+    <h2>Lookup</h2>
+    <div class="field">
+      <label for="lookupTicketId">ticket_id</label>
+      <div class="lookup-row">
+        <input type="text" id="lookupTicketId" placeholder="ticket UUID">
+        <button class="btn-secondary" onclick="lookupTicket()">Fetch Ticket</button>
+      </div>
+    </div>
+    <div class="result-panel" id="lookupTicketResult"></div>
+
+    <div class="field" style="margin-top: 16px;">
+      <label for="lookupMatchId">match_id</label>
+      <div class="lookup-row">
+        <input type="text" id="lookupMatchId" placeholder="match UUID">
+        <button class="btn-secondary" onclick="lookupMatch()">Fetch Match</button>
+      </div>
+    </div>
+    <div class="result-panel" id="lookupMatchResult"></div>
+  </div>
+
+  <!-- Active Tickets -->
+  <div class="card full-width">
+    <div class="table-header-row">
+      <h2>Active Tickets <span class="card-subtitle" id="activeTicketsSubtitle">status = waiting</span></h2>
+      <button class="btn-secondary" onclick="refreshActiveTickets()">Refresh</button>
+    </div>
+    <div class="table-wrap" id="activeTicketsTable">
+      <p class="muted">Click Refresh to load active tickets.</p>
+    </div>
+  </div>
+
+  <!-- Match Results -->
+  <div class="card full-width">
+    <h2>Match Results</h2>
+    <div class="lookup-row" style="max-width: 420px;">
+      <input type="text" id="matchResultId" placeholder="match UUID">
+      <button class="btn-secondary" onclick="fetchMatchResult()">Fetch Match</button>
+    </div>
+    <div class="result-panel" id="matchResultPanel"></div>
+  </div>
+
+</div>
+
+<script>
+  const API_BASE = "";
+
+  function getTenant() {
+    return document.getElementById("tenantSelect").value;
+  }
+
+  function esc(value) {
+    return String(value ?? "").replace(/[&<>"']/g, (c) => (
+      { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+    ));
+  }
+
+  function badge(status) {
+    const known = { waiting: "badge-waiting", matched: "badge-matched", cancelled: "badge-cancelled" };
+    const cls = known[status] || "badge-default";
+    return `<span class="badge ${cls}">${esc(status)}</span>`;
+  }
+
+  async function apiFetch(path, { method = "GET", body = null, extraHeaders = {} } = {}) {
+    const headers = { "X-Tenant-Id": getTenant(), ...extraHeaders };
+    if (body !== null) headers["Content-Type"] = "application/json";
+
+    let res;
+    try {
+      res = await fetch(API_BASE + path, {
+        method,
+        headers,
+        body: body !== null ? JSON.stringify(body) : undefined,
+      });
+    } catch (networkErr) {
+      const err = new Error("Network error — is the API reachable?");
+      err.status = 0;
+      throw err;
+    }
+
+    const text = await res.text();
+    let data = null;
+    if (text) {
+      try { data = JSON.parse(text); } catch { data = text; }
+    }
+
+    if (!res.ok) {
+      let detail = data && typeof data === "object" && "detail" in data ? data.detail : data;
+      if (typeof detail !== "string") detail = JSON.stringify(detail);
+      const err = new Error(detail || res.statusText);
+      err.status = res.status;
+      throw err;
+    }
+    return data;
+  }
+
+  function renderError(container, err) {
+    container.innerHTML = `<div class="error-box"><span class="error-status">${esc(err.status || "ERR")}</span>${esc(err.message)}</div>`;
+  }
+
+  function renderTicketCard(t) {
+    return `
+      <div class="result-block">
+        <div class="result-row"><span class="label">ticket_id</span><span class="mono">${esc(t.ticket_id)}</span></div>
+        <div class="result-row"><span class="label">status</span>${badge(t.status)}</div>
+        <div class="result-row"><span class="label">player_id</span><span class="mono">${esc(t.player_id)}</span></div>
+        <div class="result-row"><span class="label">tenant_id</span><span class="mono">${esc(t.tenant_id)}</span></div>
+        <div class="result-row"><span class="label">region</span><span class="mono">${esc(t.region)}</span></div>
+        <div class="result-row"><span class="label">queue_name</span><span class="mono">${esc(t.queue_name)}</span></div>
+        <div class="result-row"><span class="label">skill_rating</span><span class="mono">${esc(t.skill_rating)}</span></div>
+        <div class="result-row"><span class="label">partition_id</span><span class="mono">${esc(t.partition_id)}</span></div>
+        <div class="result-row"><span class="label">created_at</span><span class="mono">${esc(t.created_at)}</span></div>
+      </div>`;
+  }
+
+  function renderMatchCard(m) {
+    const players = m.players || [];
+    return `
+      <div class="result-block">
+        <div class="result-row"><span class="label">match_id</span><span class="mono">${esc(m.match_id)}</span></div>
+        <div class="result-row"><span class="label">status</span>${badge(m.status)}</div>
+        <div class="result-row"><span class="label">tenant_id</span><span class="mono">${esc(m.tenant_id)}</span></div>
+        <div class="result-row"><span class="label">region</span><span class="mono">${esc(m.region)}</span></div>
+        <div class="result-row"><span class="label">queue_name</span><span class="mono">${esc(m.queue_name)}</span></div>
+        <div class="result-row"><span class="label">created_at</span><span class="mono">${esc(m.created_at)}</span></div>
+        <div class="result-row players">
+          <span class="label">players (${players.length})</span>
+          <div class="player-chips">${players.length ? players.map((p) => `<span class="chip">${esc(p)}</span>`).join("") : '<span class="muted">none</span>'}</div>
+        </div>
+      </div>`;
+  }
+
+  async function onLoadHealth() {
+    const dotPg = document.getElementById("dotPostgres");
+    const dotRedis = document.getElementById("dotRedis");
+    try {
+      const data = await apiFetch("/health");
+      dotPg.className = "dot " + (data.postgres === "ok" ? "ok" : "bad");
+      dotPg.title = data.postgres;
+      dotRedis.className = "dot " + (data.redis === "ok" ? "ok" : "bad");
+      dotRedis.title = data.redis;
+    } catch (err) {
+      dotPg.className = "dot bad";
+      dotRedis.className = "dot bad";
+    }
+  }
+
+  function onTenantChange() {
+    document.getElementById("activeTicketsTable").innerHTML = '<p class="muted">Click Refresh to load active tickets.</p>';
+  }
+
+  async function createTicket() {
+    const resultEl = document.getElementById("createTicketResult");
+    const btn = document.getElementById("createTicketBtn");
+    const tenant = getTenant();
+
+    const body = {
+      player_id: document.getElementById("playerIdInput").value.trim(),
+      tenant_id: tenant,
+      region: document.getElementById("regionInput").value.trim(),
+      queue_name: document.getElementById("queueNameInput").value.trim(),
+      skill_rating: parseFloat(document.getElementById("skillRatingInput").value),
+    };
+    const idempotencyKey = document.getElementById("idempotencyKeyInput").value.trim();
+    const extraHeaders = {};
+    if (idempotencyKey) extraHeaders["Idempotency-Key"] = idempotencyKey;
+
+    btn.disabled = true;
+    resultEl.innerHTML = "";
+    try {
+      const ticket = await apiFetch("/v1/tickets", { method: "POST", body, extraHeaders });
+      resultEl.innerHTML = renderTicketCard(ticket);
+    } catch (err) {
+      renderError(resultEl, err);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function lookupTicket() {
+    const resultEl = document.getElementById("lookupTicketResult");
+    const ticketId = document.getElementById("lookupTicketId").value.trim();
+    if (!ticketId) return;
+    resultEl.innerHTML = "";
+    try {
+      const ticket = await apiFetch(`/v1/tickets/${encodeURIComponent(ticketId)}`);
+      resultEl.innerHTML = renderTicketCard(ticket);
+    } catch (err) {
+      renderError(resultEl, err);
+    }
+  }
+
+  async function lookupMatch() {
+    const resultEl = document.getElementById("lookupMatchResult");
+    const matchId = document.getElementById("lookupMatchId").value.trim();
+    if (!matchId) return;
+    resultEl.innerHTML = "";
+    try {
+      const match = await apiFetch(`/v1/matches/${encodeURIComponent(matchId)}`);
+      resultEl.innerHTML = renderMatchCard(match);
+    } catch (err) {
+      renderError(resultEl, err);
+    }
+  }
+
+  async function fetchMatchResult() {
+    const resultEl = document.getElementById("matchResultPanel");
+    const matchId = document.getElementById("matchResultId").value.trim();
+    if (!matchId) return;
+    resultEl.innerHTML = "";
+    try {
+      const match = await apiFetch(`/v1/matches/${encodeURIComponent(matchId)}`);
+      resultEl.innerHTML = renderMatchCard(match);
+    } catch (err) {
+      renderError(resultEl, err);
+    }
+  }
+
+  function renderTicketsTable(tickets) {
+    if (!tickets.length) {
+      return '<p class="muted">No active tickets for this tenant.</p>';
+    }
+    const rows = tickets.map((t) => `
+      <tr>
+        <td class="mono" title="${esc(t.ticket_id)}">${esc(t.ticket_id.slice(0, 8))}&hellip;</td>
+        <td>${esc(t.player_id)}</td>
+        <td>${esc(t.region)}</td>
+        <td>${esc(t.queue_name)}</td>
+        <td>${esc(t.skill_rating)}</td>
+        <td>${esc(t.partition_id)}</td>
+        <td class="mono">${esc(new Date(t.created_at).toLocaleString())}</td>
+        <td><button class="btn-small btn-danger" onclick="cancelTicket('${esc(t.ticket_id)}')">Cancel</button></td>
+      </tr>`).join("");
+    return `
+      <table>
+        <thead>
+          <tr>
+            <th>ticket_id</th><th>player_id</th><th>region</th><th>queue_name</th>
+            <th>skill_rating</th><th>partition_id</th><th>created_at</th><th></th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
+
+  async function refreshActiveTickets() {
+    const tableEl = document.getElementById("activeTicketsTable");
+    tableEl.innerHTML = '<p class="muted">Loading&hellip;</p>';
+    try {
+      const tickets = await apiFetch("/v1/tickets");
+      tableEl.innerHTML = renderTicketsTable(tickets);
+    } catch (err) {
+      renderError(tableEl, err);
+    }
+  }
+
+  async function cancelTicket(ticketId) {
+    try {
+      await apiFetch(`/v1/tickets/${encodeURIComponent(ticketId)}`, { method: "DELETE" });
+      refreshActiveTickets();
+    } catch (err) {
+      const tableEl = document.getElementById("activeTicketsTable");
+      renderError(tableEl, err);
+    }
+  }
+
+  onLoadHealth();
+</script>
+
+</body>
+</html>
