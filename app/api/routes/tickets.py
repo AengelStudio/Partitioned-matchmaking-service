@@ -63,6 +63,17 @@ async def create_ticket(
     return response
 
 
+@router.get("/tickets", response_model=list[TicketResponse])
+async def list_tickets(tenant: dict = Depends(require_tenant)):
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM tickets WHERE tenant_id = $1 AND status = 'waiting'",
+            tenant["tenant_id"],
+        )
+    return [TicketResponse(**{**dict(row), "ticket_id": str(row["ticket_id"])}) for row in rows]
+
+
 @router.get("/tickets/{ticket_id}", response_model=TicketResponse)
 async def get_ticket(ticket_id: str, tenant: dict = Depends(require_tenant)):
     pool = get_pool()
