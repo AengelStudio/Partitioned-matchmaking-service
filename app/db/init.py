@@ -22,6 +22,13 @@ def main() -> None:
                 """,
                 (settings.matchmaking_partitions - 1,),
             )
+            cur.execute(
+                """
+                INSERT INTO tenants (tenant_id, name)
+                VALUES ('studio_a', 'studio_a')
+                ON CONFLICT (tenant_id) DO NOTHING
+                """
+            )
         conn.commit()
 
 

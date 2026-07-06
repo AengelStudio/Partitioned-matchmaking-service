@@ -1,5 +1,6 @@
 import hashlib
 import json
+from uuid import UUID
 
 import asyncpg
 
@@ -16,12 +17,14 @@ async def check_idempotency_key(
         row = await conn.fetchrow(
             """SELECT request_hash, response_body
                FROM idempotency_keys
-               WHERE key = $1 AND tenant_id = $2""",
-            key, tenant_id,
+               WHERE tenant_id = $1 AND idempotency_key = $2""",
+            tenant_id,
+            key,
         )
     if row is None:
         return False, None, False
-    stored_response = json.loads(row["response_body"])
+    body = row["response_body"]
+    stored_response = body if isinstance(body, dict) else json.loads(body)
     hash_matched = row["request_hash"] == request_hash
     return True, stored_response, hash_matched
 
@@ -31,10 +34,18 @@ async def store_idempotency_key(
     key: str,
     tenant_id: str,
     request_hash: str,
+    response_status: int,
     response_body: dict,
+    ticket_id: UUID,
 ) -> None:
     await conn.execute(
-        """INSERT INTO idempotency_keys (key, tenant_id, request_hash, response_body)
-           VALUES ($1, $2, $3, $4::jsonb)""",
-        key, tenant_id, request_hash, json.dumps(response_body),
+        """INSERT INTO idempotency_keys
+               (tenant_id, idempotency_key, request_hash, response_status, response_body, ticket_id)
+           VALUES ($1, $2, $3, $4, $5::jsonb, $6)""",
+        tenant_id,
+        key,
+        request_hash,
+        response_status,
+        json.dumps(response_body),
+        ticket_id,
     )
