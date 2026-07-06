@@ -319,6 +319,19 @@
   }
 
   .table-wrap { overflow-x: auto; }
+
+  .admission-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  }
+  .admission-pill.ok { background: var(--green-bg); color: var(--green); }
+  .admission-pill.warn { background: var(--yellow-bg); color: var(--yellow); }
+  .admission-pill.full { background: var(--red-bg); color: var(--red); }
 </style>
 </head>
 <body>
@@ -345,6 +358,10 @@
   <!-- Create Ticket -->
   <div class="card">
     <h2>Create Ticket</h2>
+    <div class="field" id="admissionStatusField">
+      <label>Admission Control Status</label>
+      <div id="admissionStatus" class="muted">Click Refresh in Active Tickets to load.</div>
+    </div>
     <div class="field-row">
       <div class="field">
         <label for="playerIdInput">player_id</label>
@@ -361,8 +378,8 @@
         <input type="text" id="queueNameInput" placeholder="ranked-solo">
       </div>
       <div class="field">
-        <label for="skillRatingInput">skill_rating</label>
-        <input type="number" id="skillRatingInput" placeholder="1500" step="any">
+        <label for="skillRatingInput">skill</label>
+        <input type="number" id="skillRatingInput" placeholder="1500" step="1">
       </div>
     </div>
     <div class="field">
@@ -420,6 +437,10 @@
 
 <script>
   const API_BASE = "";
+  const TENANT_LIMITS = {
+    "tenant-1": { maxTicketsInFlight: 50 },
+    "tenant-2": { maxTicketsInFlight: 10 },
+  };
 
   function getTenant() {
     return document.getElementById("tenantSelect").value;
@@ -483,7 +504,7 @@
         <div class="result-row"><span class="label">tenant_id</span><span class="mono">${esc(t.tenant_id)}</span></div>
         <div class="result-row"><span class="label">region</span><span class="mono">${esc(t.region)}</span></div>
         <div class="result-row"><span class="label">queue_name</span><span class="mono">${esc(t.queue_name)}</span></div>
-        <div class="result-row"><span class="label">skill_rating</span><span class="mono">${esc(t.skill_rating)}</span></div>
+        <div class="result-row"><span class="label">skill</span><span class="mono">${esc(t.skill)}</span></div>
         <div class="result-row"><span class="label">partition_id</span><span class="mono">${esc(t.partition_id)}</span></div>
         <div class="result-row"><span class="label">created_at</span><span class="mono">${esc(t.created_at)}</span></div>
       </div>`;
@@ -523,6 +544,23 @@
 
   function onTenantChange() {
     document.getElementById("activeTicketsTable").innerHTML = '<p class="muted">Click Refresh to load active tickets.</p>';
+    document.getElementById("admissionStatus").innerHTML = '<span class="muted">Click Refresh in Active Tickets to load.</span>';
+  }
+
+  function renderAdmissionStatus(tenant, inFlightCount) {
+    const limits = TENANT_LIMITS[tenant];
+    if (!limits) {
+      return `<span class="mono">${inFlightCount} in-flight</span> <span class="muted">(max unknown for ${esc(tenant)})</span>`;
+    }
+    const max = limits.maxTicketsInFlight;
+    const ratio = max > 0 ? inFlightCount / max : 1;
+    const level = ratio >= 1 ? "full" : ratio >= 0.8 ? "warn" : "ok";
+    return `<span class="admission-pill ${level}">${inFlightCount} / ${max} in-flight</span>`;
+  }
+
+  function updateAdmissionStatus(tickets) {
+    const el = document.getElementById("admissionStatus");
+    el.innerHTML = renderAdmissionStatus(getTenant(), tickets.length);
   }
 
   async function createTicket() {
@@ -532,10 +570,9 @@
 
     const body = {
       player_id: document.getElementById("playerIdInput").value.trim(),
-      tenant_id: tenant,
       region: document.getElementById("regionInput").value.trim(),
       queue_name: document.getElementById("queueNameInput").value.trim(),
-      skill_rating: parseFloat(document.getElementById("skillRatingInput").value),
+      skill: parseInt(document.getElementById("skillRatingInput").value, 10),
     };
     const idempotencyKey = document.getElementById("idempotencyKeyInput").value.trim();
     const extraHeaders = {};
@@ -602,7 +639,7 @@
         <td>${esc(t.player_id)}</td>
         <td>${esc(t.region)}</td>
         <td>${esc(t.queue_name)}</td>
-        <td>${esc(t.skill_rating)}</td>
+        <td>${esc(t.skill)}</td>
         <td>${esc(t.partition_id)}</td>
         <td class="mono">${esc(new Date(t.created_at).toLocaleString())}</td>
         <td><button class="btn-small btn-danger" onclick="cancelTicket('${esc(t.ticket_id)}')">Cancel</button></td>
@@ -612,7 +649,7 @@
         <thead>
           <tr>
             <th>ticket_id</th><th>player_id</th><th>region</th><th>queue_name</th>
-            <th>skill_rating</th><th>partition_id</th><th>created_at</th><th></th>
+            <th>skill</th><th>partition_id</th><th>created_at</th><th></th>
           </tr>
         </thead>
         <tbody>${rows}</tbody>
@@ -625,6 +662,7 @@
     try {
       const tickets = await apiFetch("/v1/tickets");
       tableEl.innerHTML = renderTicketsTable(tickets);
+      updateAdmissionStatus(tickets);
     } catch (err) {
       renderError(tableEl, err);
     }

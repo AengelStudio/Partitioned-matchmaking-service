@@ -2,6 +2,11 @@ import asyncpg
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from app.core.admission import (
+    check_partition_depth,
+    check_rate_limit,
+    check_tenant_quota,
+)
 from app.core.idempotency import (
     check_idempotency_key,
     compute_request_hash,
@@ -9,6 +14,7 @@ from app.core.idempotency import (
 )
 from app.core.tenants import require_tenant
 from app.db.postgres import get_pool
+from app.db.redis import get_redis
 from app.models.tickets import (
     TicketCancelResponse,
     TicketCreate,
@@ -70,6 +76,16 @@ async def create_ticket(
     partition_id = compute_partition_id(
         tenant_id, body.region, body.queue_name, settings.matchmaking_partitions
     )
+
+    rejection = await check_rate_limit(get_redis(), tenant)
+    if rejection is not None:
+        return rejection
+    rejection = await check_tenant_quota(pool, tenant)
+    if rejection is not None:
+        return rejection
+    rejection = await check_partition_depth(pool, partition_id)
+    if rejection is not None:
+        return rejection
 
     try:
         async with pool.acquire() as conn:
