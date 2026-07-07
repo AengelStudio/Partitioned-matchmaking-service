@@ -14,10 +14,10 @@ async def check_rate_limit(redis: Redis, tenant: dict) -> JSONResponse | None:
     now = int(time.time())
     key = f"rate:{tenant_id}:{now}"
 
-    pipe = redis.pipeline()
-    pipe.incr(key)
-    pipe.expire(key, 2)
-    count, _ = await pipe.execute()
+    async with redis.pipeline() as pipe:
+        pipe.incr(key)
+        pipe.expire(key, 2)
+        count, _ = await pipe.execute()
 
     if count > tenant["max_tickets_per_second"]:
         return JSONResponse(
