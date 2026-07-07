@@ -28,3 +28,12 @@ async def migrate() -> None:
             ON CONFLICT (tenant_id) DO NOTHING
             """
         )
+        await conn.execute(
+            """
+            INSERT INTO tenants (tenant_id, name, max_tickets_per_second, max_tickets_in_flight)
+            VALUES
+                ('tenant-1', 'tenant-1', 20, 50),
+                ('tenant-2', 'tenant-2', 5, 10)
+            ON CONFLICT (tenant_id) DO NOTHING
+            """
+        )
