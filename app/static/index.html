@@ -332,6 +332,45 @@
   .admission-pill.ok { background: var(--green-bg); color: var(--green); }
   .admission-pill.warn { background: var(--yellow-bg); color: var(--yellow); }
   .admission-pill.full { background: var(--red-bg); color: var(--red); }
+
+  .stat-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 14px;
+  }
+  .stat-box {
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+    text-align: center;
+  }
+  .stat-number {
+    font-size: 28px;
+    font-weight: 700;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  }
+  .stat-number.stat-good { color: var(--green); }
+  .stat-number.stat-bad { color: var(--red); }
+  .stat-label {
+    margin-top: 4px;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  .stat-subitems {
+    margin-top: 10px;
+    border-top: 1px solid var(--border);
+    padding-top: 8px;
+    text-align: left;
+  }
+  .stat-subrow {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    color: var(--text-dim);
+    padding: 2px 0;
+  }
+  .stat-subrow .mono { color: var(--text); }
 </style>
 </head>
 <body>
@@ -416,7 +455,10 @@
   <div class="card full-width">
     <div class="table-header-row">
       <h2>Active Tickets <span class="card-subtitle" id="activeTicketsSubtitle">status = waiting</span></h2>
-      <button class="btn-secondary" onclick="refreshActiveTickets()">Refresh</button>
+      <div style="display: flex; gap: 8px;">
+        <button class="btn-secondary" onclick="refreshActiveTickets()">Refresh</button>
+        <button class="btn-danger" onclick="cancelAllTickets()">Cancel All</button>
+      </div>
     </div>
     <div class="table-wrap" id="activeTicketsTable">
       <p class="muted">Click Refresh to load active tickets.</p>
@@ -431,6 +473,31 @@
       <button class="btn-secondary" onclick="fetchMatchResult()">Fetch Match</button>
     </div>
     <div class="result-panel" id="matchResultPanel"></div>
+  </div>
+
+  <!-- Stress Test -->
+  <div class="card full-width">
+    <div class="table-header-row">
+      <h2>Stress Test <span class="card-subtitle">bursts POST /v1/tickets against the selected tenant</span></h2>
+    </div>
+    <div class="lookup-row" style="max-width: 420px;">
+      <input type="number" id="stressTestCount" value="50" min="1" max="10000" placeholder="number of requests">
+      <button onclick="runStressTest()">Run Stress Test</button>
+    </div>
+    <div id="stressTestResult">
+      <p class="muted">Set a count and click Run Stress Test.</p>
+    </div>
+  </div>
+
+  <!-- Live Metrics -->
+  <div class="card full-width">
+    <div class="table-header-row">
+      <h2>Live Metrics <span class="card-subtitle" id="metricsUpdatedAt">not loaded yet</span></h2>
+      <button class="btn-secondary" onclick="refreshMetrics()">Refresh Metrics</button>
+    </div>
+    <div id="metricsPanel">
+      <p class="muted">Click Refresh Metrics to load current counter values.</p>
+    </div>
   </div>
 
 </div>
@@ -527,6 +594,68 @@
       </div>`;
   }
 
+  function parsePrometheusMetrics(text, tenantId) {
+    const totals = {
+      tickets_created_total: 0,
+      tickets_rejected_total: 0,
+      tickets_cancelled_total: 0,
+      active_tickets: 0,
+    };
+    const rejectedByReason = {};
+    for (const rawLine of text.split("\n")) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#")) continue;
+      const lastSpace = line.lastIndexOf(" ");
+      if (lastSpace === -1) continue;
+      const nameAndLabels = line.slice(0, lastSpace);
+      const value = parseFloat(line.slice(lastSpace + 1));
+      if (Number.isNaN(value)) continue;
+      const braceIdx = nameAndLabels.indexOf("{");
+      const name = braceIdx === -1 ? nameAndLabels : nameAndLabels.slice(0, braceIdx);
+      if (!(name in totals)) continue;
+      const labelsStr = braceIdx === -1 ? "" : nameAndLabels.slice(braceIdx);
+      const tenantMatch = labelsStr.match(/tenant_id="([^"]*)"/);
+      if (tenantId && (!tenantMatch || tenantMatch[1] !== tenantId)) continue;
+      totals[name] += value;
+      if (name === "tickets_rejected_total") {
+        const reasonMatch = labelsStr.match(/reason="([^"]*)"/);
+        if (reasonMatch) {
+          rejectedByReason[reasonMatch[1]] = (rejectedByReason[reasonMatch[1]] || 0) + value;
+        }
+      }
+    }
+    return { totals, rejectedByReason };
+  }
+
+  function renderMetricsPanel({ totals, rejectedByReason }) {
+    const fmt = (n) => Math.round(n).toLocaleString();
+    const reasonRows = ["rate_limit", "tenant_quota", "partition_overload"]
+      .map((r) => `<div class="stat-subrow"><span>${esc(r)}</span><span class="mono">${fmt(rejectedByReason[r] || 0)}</span></div>`)
+      .join("");
+    const createdCls = totals.tickets_created_total > 0 ? "stat-good" : "";
+    const rejectedCls = totals.tickets_rejected_total > 0 ? "stat-bad" : "";
+    return `
+      <div class="stat-grid">
+        <div class="stat-box">
+          <div class="stat-number ${createdCls}">${fmt(totals.tickets_created_total)}</div>
+          <div class="stat-label">Tickets Created</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-number ${rejectedCls}">${fmt(totals.tickets_rejected_total)}</div>
+          <div class="stat-label">Tickets Rejected</div>
+          <div class="stat-subitems">${reasonRows}</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-number">${fmt(totals.tickets_cancelled_total)}</div>
+          <div class="stat-label">Tickets Cancelled</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-number">${fmt(totals.active_tickets)}</div>
+          <div class="stat-label">Active Tickets</div>
+        </div>
+      </div>`;
+  }
+
   async function onLoadHealth() {
     const dotPg = document.getElementById("dotPostgres");
     const dotRedis = document.getElementById("dotRedis");
@@ -545,6 +674,8 @@
   function onTenantChange() {
     document.getElementById("activeTicketsTable").innerHTML = '<p class="muted">Click Refresh to load active tickets.</p>';
     document.getElementById("admissionStatus").innerHTML = '<span class="muted">Click Refresh in Active Tickets to load.</span>';
+    document.getElementById("metricsPanel").innerHTML = '<p class="muted">Click Refresh Metrics to load current counter values.</p>';
+    document.getElementById("metricsUpdatedAt").textContent = "not loaded yet";
   }
 
   function renderAdmissionStatus(tenant, inFlightCount) {
@@ -675,6 +806,92 @@
     } catch (err) {
       const tableEl = document.getElementById("activeTicketsTable");
       renderError(tableEl, err);
+    }
+  }
+
+  async function cancelAllTickets() {
+    const tableEl = document.getElementById("activeTicketsTable");
+    try {
+      const tickets = await apiFetch("/v1/tickets");
+      if (!tickets.length) {
+        tableEl.innerHTML = renderTicketsTable(tickets);
+        updateAdmissionStatus(tickets);
+        return;
+      }
+      tableEl.innerHTML = `<p class="muted">Cancelling ${tickets.length} ticket(s)&hellip;</p>`;
+      await Promise.all(
+        tickets.map((t) =>
+          apiFetch(`/v1/tickets/${encodeURIComponent(t.ticket_id)}`, { method: "DELETE" }).catch(() => null)
+        )
+      );
+      refreshActiveTickets();
+    } catch (err) {
+      renderError(tableEl, err);
+    }
+  }
+
+  async function runStressTest() {
+    const countInput = document.getElementById("stressTestCount");
+    const resultEl = document.getElementById("stressTestResult");
+    const count = Math.max(1, parseInt(countInput.value, 10) || 1);
+    const tenant = getTenant();
+
+    resultEl.innerHTML = '<p class="muted">Running&hellip;</p>';
+    const start = performance.now();
+
+    const requests = Array.from({ length: count }, (_, i) =>
+      fetch(API_BASE + "/v1/tickets", {
+        method: "POST",
+        headers: { "X-Tenant-Id": tenant, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          player_id: `stress-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 7)}`,
+          region: "us-east",
+          queue_name: "ranked",
+          skill: 1000,
+        }),
+      })
+        .then((res) => res.status)
+        .catch(() => 0)
+    );
+
+    const statuses = await Promise.all(requests);
+    const elapsedMs = Math.round(performance.now() - start);
+
+    const counts = {};
+    for (const s of statuses) counts[s] = (counts[s] || 0) + 1;
+    const rows = Object.keys(counts)
+      .sort()
+      .map((s) => {
+        const label = s === "0" ? "network error" : `HTTP ${s}`;
+        return `<div class="stat-subrow"><span>${esc(label)}</span><span class="mono">${counts[s]}</span></div>`;
+      })
+      .join("");
+
+    resultEl.innerHTML = `
+      <div class="result-block">
+        <div class="result-row"><span class="label">tenant</span><span class="mono">${esc(tenant)}</span></div>
+        <div class="result-row"><span class="label">requests</span><span class="mono">${count}</span></div>
+        <div class="result-row"><span class="label">elapsed</span><span class="mono">${elapsedMs} ms</span></div>
+        <div class="stat-subitems">${rows}</div>
+      </div>`;
+  }
+
+  async function refreshMetrics() {
+    const panelEl = document.getElementById("metricsPanel");
+    const updatedEl = document.getElementById("metricsUpdatedAt");
+    const tenant = getTenant();
+    try {
+      const res = await fetch(API_BASE + "/metrics");
+      if (!res.ok) {
+        const err = new Error(res.statusText);
+        err.status = res.status;
+        throw err;
+      }
+      const text = await res.text();
+      panelEl.innerHTML = renderMetricsPanel(parsePrometheusMetrics(text, tenant));
+      updatedEl.textContent = `${tenant} · updated ${new Date().toLocaleString()}`;
+    } catch (err) {
+      renderError(panelEl, err);
     }
   }
 

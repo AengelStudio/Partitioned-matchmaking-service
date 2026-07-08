@@ -12,6 +12,12 @@ from app.core.idempotency import (
     compute_request_hash,
     store_idempotency_key,
 )
+from app.core.metrics import (
+    active_tickets,
+    tickets_cancelled_total,
+    tickets_created_total,
+    tickets_rejected_total,
+)
 from app.core.tenants import require_tenant
 from app.db.postgres import get_pool
 from app.db.redis import get_redis
@@ -79,12 +85,15 @@ async def create_ticket(
 
     rejection = await check_rate_limit(get_redis(), tenant)
     if rejection is not None:
+        tickets_rejected_total.labels(tenant_id=tenant_id, reason="rate_limit").inc()
         return rejection
     rejection = await check_tenant_quota(pool, tenant)
     if rejection is not None:
+        tickets_rejected_total.labels(tenant_id=tenant_id, reason="tenant_quota").inc()
         return rejection
     rejection = await check_partition_depth(pool, partition_id)
     if rejection is not None:
+        tickets_rejected_total.labels(tenant_id=tenant_id, reason="partition_overload").inc()
         return rejection
 
     try:
@@ -104,6 +113,11 @@ async def create_ticket(
                 )
                 response = _ticket_response(dict(row))
                 response_body = response.model_dump(mode="json")
+
+                tickets_created_total.labels(
+                    tenant_id=tenant_id, region=body.region, queue_name=body.queue_name
+                ).inc()
+                active_tickets.labels(tenant_id=tenant_id, partition_id=str(partition_id)).inc()
 
                 if idempotency_key is not None:
                     await store_idempotency_key(
@@ -159,10 +173,14 @@ async def cancel_ticket(ticket_id: str, tenant: dict = Depends(require_tenant)):
                WHERE ticket_id = $1::uuid
                  AND tenant_id = $2
                  AND status IN ('waiting', 'reserved')
-               RETURNING ticket_id, status, cancelled_at""",
+               RETURNING ticket_id, status, cancelled_at, partition_id""",
             ticket_id,
             tenant["tenant_id"],
         )
     if row is None:
         raise HTTPException(status_code=404, detail="Ticket not found")
+    tickets_cancelled_total.labels(tenant_id=tenant["tenant_id"]).inc()
+    active_tickets.labels(
+        tenant_id=tenant["tenant_id"], partition_id=str(row["partition_id"])
+    ).dec()
     return TicketCancelResponse(**dict(row))
