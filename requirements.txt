@@ -10,3 +10,4 @@ pytest-asyncio
 httpx
 python-dotenv
 prometheus-client
+psycopg[binary,pool]
