@@ -472,6 +472,20 @@
     <div class="result-panel" id="matchResultPanel"></div>
   </div>
 
+  <!-- Stress Test -->
+  <div class="card full-width">
+    <div class="table-header-row">
+      <h2>Stress Test <span class="card-subtitle">bursts POST /v1/tickets against the selected tenant</span></h2>
+    </div>
+    <div class="lookup-row" style="max-width: 420px;">
+      <input type="number" id="stressTestCount" value="50" min="1" max="10000" placeholder="number of requests">
+      <button onclick="runStressTest()">Run Stress Test</button>
+    </div>
+    <div id="stressTestResult">
+      <p class="muted">Set a count and click Run Stress Test.</p>
+    </div>
+  </div>
+
   <!-- Live Metrics -->
   <div class="card full-width">
     <div class="table-header-row">
@@ -785,6 +799,52 @@
       const tableEl = document.getElementById("activeTicketsTable");
       renderError(tableEl, err);
     }
+  }
+
+  async function runStressTest() {
+    const countInput = document.getElementById("stressTestCount");
+    const resultEl = document.getElementById("stressTestResult");
+    const count = Math.max(1, parseInt(countInput.value, 10) || 1);
+    const tenant = getTenant();
+
+    resultEl.innerHTML = '<p class="muted">Running&hellip;</p>';
+    const start = performance.now();
+
+    const requests = Array.from({ length: count }, (_, i) =>
+      fetch(API_BASE + "/v1/tickets", {
+        method: "POST",
+        headers: { "X-Tenant-Id": tenant, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          player_id: `stress-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 7)}`,
+          region: "us-east",
+          queue_name: "ranked",
+          skill: 1000,
+        }),
+      })
+        .then((res) => res.status)
+        .catch(() => 0)
+    );
+
+    const statuses = await Promise.all(requests);
+    const elapsedMs = Math.round(performance.now() - start);
+
+    const counts = {};
+    for (const s of statuses) counts[s] = (counts[s] || 0) + 1;
+    const rows = Object.keys(counts)
+      .sort()
+      .map((s) => {
+        const label = s === "0" ? "network error" : `HTTP ${s}`;
+        return `<div class="stat-subrow"><span>${esc(label)}</span><span class="mono">${counts[s]}</span></div>`;
+      })
+      .join("");
+
+    resultEl.innerHTML = `
+      <div class="result-block">
+        <div class="result-row"><span class="label">tenant</span><span class="mono">${esc(tenant)}</span></div>
+        <div class="result-row"><span class="label">requests</span><span class="mono">${count}</span></div>
+        <div class="result-row"><span class="label">elapsed</span><span class="mono">${elapsedMs} ms</span></div>
+        <div class="stat-subitems">${rows}</div>
+      </div>`;
   }
 
   async function refreshMetrics() {
