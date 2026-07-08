@@ -332,6 +332,45 @@
   .admission-pill.ok { background: var(--green-bg); color: var(--green); }
   .admission-pill.warn { background: var(--yellow-bg); color: var(--yellow); }
   .admission-pill.full { background: var(--red-bg); color: var(--red); }
+
+  .stat-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 14px;
+  }
+  .stat-box {
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+    text-align: center;
+  }
+  .stat-number {
+    font-size: 28px;
+    font-weight: 700;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  }
+  .stat-number.stat-good { color: var(--green); }
+  .stat-number.stat-bad { color: var(--red); }
+  .stat-label {
+    margin-top: 4px;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  .stat-subitems {
+    margin-top: 10px;
+    border-top: 1px solid var(--border);
+    padding-top: 8px;
+    text-align: left;
+  }
+  .stat-subrow {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    color: var(--text-dim);
+    padding: 2px 0;
+  }
+  .stat-subrow .mono { color: var(--text); }
 </style>
 </head>
 <body>
@@ -433,6 +472,17 @@
     <div class="result-panel" id="matchResultPanel"></div>
   </div>
 
+  <!-- Live Metrics -->
+  <div class="card full-width">
+    <div class="table-header-row">
+      <h2>Live Metrics <span class="card-subtitle" id="metricsUpdatedAt">not loaded yet</span></h2>
+      <button class="btn-secondary" onclick="refreshMetrics()">Refresh Metrics</button>
+    </div>
+    <div id="metricsPanel">
+      <p class="muted">Click Refresh Metrics to load current counter values.</p>
+    </div>
+  </div>
+
 </div>
 
 <script>
@@ -523,6 +573,65 @@
         <div class="result-row players">
           <span class="label">players (${players.length})</span>
           <div class="player-chips">${players.length ? players.map((p) => `<span class="chip">${esc(p)}</span>`).join("") : '<span class="muted">none</span>'}</div>
+        </div>
+      </div>`;
+  }
+
+  function parsePrometheusMetrics(text) {
+    const totals = {
+      tickets_created_total: 0,
+      tickets_rejected_total: 0,
+      tickets_cancelled_total: 0,
+      active_tickets: 0,
+    };
+    const rejectedByReason = {};
+    for (const rawLine of text.split("\n")) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#")) continue;
+      const lastSpace = line.lastIndexOf(" ");
+      if (lastSpace === -1) continue;
+      const nameAndLabels = line.slice(0, lastSpace);
+      const value = parseFloat(line.slice(lastSpace + 1));
+      if (Number.isNaN(value)) continue;
+      const braceIdx = nameAndLabels.indexOf("{");
+      const name = braceIdx === -1 ? nameAndLabels : nameAndLabels.slice(0, braceIdx);
+      if (!(name in totals)) continue;
+      totals[name] += value;
+      if (name === "tickets_rejected_total" && braceIdx !== -1) {
+        const reasonMatch = nameAndLabels.slice(braceIdx).match(/reason="([^"]*)"/);
+        if (reasonMatch) {
+          rejectedByReason[reasonMatch[1]] = (rejectedByReason[reasonMatch[1]] || 0) + value;
+        }
+      }
+    }
+    return { totals, rejectedByReason };
+  }
+
+  function renderMetricsPanel({ totals, rejectedByReason }) {
+    const fmt = (n) => Math.round(n).toLocaleString();
+    const reasonRows = ["rate_limit", "tenant_quota", "partition_overload"]
+      .map((r) => `<div class="stat-subrow"><span>${esc(r)}</span><span class="mono">${fmt(rejectedByReason[r] || 0)}</span></div>`)
+      .join("");
+    const createdCls = totals.tickets_created_total > 0 ? "stat-good" : "";
+    const rejectedCls = totals.tickets_rejected_total > 0 ? "stat-bad" : "";
+    return `
+      <div class="stat-grid">
+        <div class="stat-box">
+          <div class="stat-number ${createdCls}">${fmt(totals.tickets_created_total)}</div>
+          <div class="stat-label">Tickets Created</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-number ${rejectedCls}">${fmt(totals.tickets_rejected_total)}</div>
+          <div class="stat-label">Tickets Rejected</div>
+          <div class="stat-subitems">${reasonRows}</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-number">${fmt(totals.tickets_cancelled_total)}</div>
+          <div class="stat-label">Tickets Cancelled</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-number">${fmt(totals.active_tickets)}</div>
+          <div class="stat-label">Active Tickets</div>
         </div>
       </div>`;
   }
@@ -675,6 +784,24 @@
     } catch (err) {
       const tableEl = document.getElementById("activeTicketsTable");
       renderError(tableEl, err);
+    }
+  }
+
+  async function refreshMetrics() {
+    const panelEl = document.getElementById("metricsPanel");
+    const updatedEl = document.getElementById("metricsUpdatedAt");
+    try {
+      const res = await fetch(API_BASE + "/metrics");
+      if (!res.ok) {
+        const err = new Error(res.statusText);
+        err.status = res.status;
+        throw err;
+      }
+      const text = await res.text();
+      panelEl.innerHTML = renderMetricsPanel(parsePrometheusMetrics(text));
+      updatedEl.textContent = new Date().toLocaleString();
+    } catch (err) {
+      renderError(panelEl, err);
     }
   }
 
