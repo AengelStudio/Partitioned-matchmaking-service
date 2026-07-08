@@ -455,7 +455,10 @@
   <div class="card full-width">
     <div class="table-header-row">
       <h2>Active Tickets <span class="card-subtitle" id="activeTicketsSubtitle">status = waiting</span></h2>
-      <button class="btn-secondary" onclick="refreshActiveTickets()">Refresh</button>
+      <div style="display: flex; gap: 8px;">
+        <button class="btn-secondary" onclick="refreshActiveTickets()">Refresh</button>
+        <button class="btn-danger" onclick="cancelAllTickets()">Cancel All</button>
+      </div>
     </div>
     <div class="table-wrap" id="activeTicketsTable">
       <p class="muted">Click Refresh to load active tickets.</p>
@@ -591,7 +594,7 @@
       </div>`;
   }
 
-  function parsePrometheusMetrics(text) {
+  function parsePrometheusMetrics(text, tenantId) {
     const totals = {
       tickets_created_total: 0,
       tickets_rejected_total: 0,
@@ -610,9 +613,12 @@
       const braceIdx = nameAndLabels.indexOf("{");
       const name = braceIdx === -1 ? nameAndLabels : nameAndLabels.slice(0, braceIdx);
       if (!(name in totals)) continue;
+      const labelsStr = braceIdx === -1 ? "" : nameAndLabels.slice(braceIdx);
+      const tenantMatch = labelsStr.match(/tenant_id="([^"]*)"/);
+      if (tenantId && (!tenantMatch || tenantMatch[1] !== tenantId)) continue;
       totals[name] += value;
-      if (name === "tickets_rejected_total" && braceIdx !== -1) {
-        const reasonMatch = nameAndLabels.slice(braceIdx).match(/reason="([^"]*)"/);
+      if (name === "tickets_rejected_total") {
+        const reasonMatch = labelsStr.match(/reason="([^"]*)"/);
         if (reasonMatch) {
           rejectedByReason[reasonMatch[1]] = (rejectedByReason[reasonMatch[1]] || 0) + value;
         }
@@ -668,6 +674,8 @@
   function onTenantChange() {
     document.getElementById("activeTicketsTable").innerHTML = '<p class="muted">Click Refresh to load active tickets.</p>';
     document.getElementById("admissionStatus").innerHTML = '<span class="muted">Click Refresh in Active Tickets to load.</span>';
+    document.getElementById("metricsPanel").innerHTML = '<p class="muted">Click Refresh Metrics to load current counter values.</p>';
+    document.getElementById("metricsUpdatedAt").textContent = "not loaded yet";
   }
 
   function renderAdmissionStatus(tenant, inFlightCount) {
@@ -801,6 +809,27 @@
     }
   }
 
+  async function cancelAllTickets() {
+    const tableEl = document.getElementById("activeTicketsTable");
+    try {
+      const tickets = await apiFetch("/v1/tickets");
+      if (!tickets.length) {
+        tableEl.innerHTML = renderTicketsTable(tickets);
+        updateAdmissionStatus(tickets);
+        return;
+      }
+      tableEl.innerHTML = `<p class="muted">Cancelling ${tickets.length} ticket(s)&hellip;</p>`;
+      await Promise.all(
+        tickets.map((t) =>
+          apiFetch(`/v1/tickets/${encodeURIComponent(t.ticket_id)}`, { method: "DELETE" }).catch(() => null)
+        )
+      );
+      refreshActiveTickets();
+    } catch (err) {
+      renderError(tableEl, err);
+    }
+  }
+
   async function runStressTest() {
     const countInput = document.getElementById("stressTestCount");
     const resultEl = document.getElementById("stressTestResult");
@@ -850,6 +879,7 @@
   async function refreshMetrics() {
     const panelEl = document.getElementById("metricsPanel");
     const updatedEl = document.getElementById("metricsUpdatedAt");
+    const tenant = getTenant();
     try {
       const res = await fetch(API_BASE + "/metrics");
       if (!res.ok) {
@@ -858,8 +888,8 @@
         throw err;
       }
       const text = await res.text();
-      panelEl.innerHTML = renderMetricsPanel(parsePrometheusMetrics(text));
-      updatedEl.textContent = new Date().toLocaleString();
+      panelEl.innerHTML = renderMetricsPanel(parsePrometheusMetrics(text, tenant));
+      updatedEl.textContent = `${tenant} · updated ${new Date().toLocaleString()}`;
     } catch (err) {
       renderError(panelEl, err);
     }
