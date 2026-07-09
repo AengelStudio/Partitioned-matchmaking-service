@@ -81,3 +81,41 @@ Invoke-RestMethod -Uri http://localhost:8080/v1/tickets -Method POST `
 ```
 
 On Linux/Mac, use `curl` instead of `curl.exe`.
+
+## Worker Observability
+
+The matchmaking worker exposes `/health` and `/metrics` on `WORKER_METRICS_PORT` (default `9090`). Metrics answer where time is spent per loop, whether leases/reservations are healthy, the match creation rate, and which stage is causing a backlog.
+
+**Health check**
+
+```powershell
+curl.exe http://localhost:9090/health
+```
+
+**Raw metrics**
+
+```powershell
+curl.exe http://localhost:9090/metrics
+```
+
+**Watch key counters change under load**
+
+```powershell
+while ($true) { curl.exe -s http://localhost:9090/metrics | Select-String "matches_created_total|matches_failed_total|loop_duration_ms|pair_search_ms|match_creation_ms"; Start-Sleep -Seconds 2 }
+```
+
+On Linux/Mac:
+
+```bash
+watch -n 2 'curl -s http://localhost:9090/metrics | grep -E "matches_created_total|matches_failed_total|loop_duration_ms|pair_search_ms|match_creation_ms"'
+```
+
+**Validation script**
+
+`scripts/validate_worker_metrics.py` checks that every expected metric name is present on `/metrics` and reports counter deltas across a sample interval, useful for confirming a worker is actually making progress under load:
+
+```powershell
+python scripts/validate_worker_metrics.py --host localhost --port 9090 --interval 5
+```
+
+Set `LOG_LEVEL=info` (in `.env`) to see structured per-stage logs such as `partitions_claimed`, `tickets_fetched`, `pair_search_completed`, `match_created`, and `match_creation_failed`, each tagged with `worker_id`, partition id(s), and ticket/match identifiers.
