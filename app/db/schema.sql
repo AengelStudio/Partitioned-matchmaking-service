@@ -4,8 +4,8 @@ CREATE TABLE IF NOT EXISTS tenants (
     tenant_id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
 
-    ticket_rate_limit_per_minute INT NOT NULL DEFAULT 300,
-    max_waiting_tickets INT NOT NULL DEFAULT 5000,
+    max_tickets_per_second INT NOT NULL DEFAULT 20,
+    max_tickets_in_flight INT NOT NULL DEFAULT 50,
     max_partition_depth INT NOT NULL DEFAULT 1000,
 
     callback_url TEXT,
@@ -13,6 +13,22 @@ CREATE TABLE IF NOT EXISTS tenants (
 
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'tenants' AND column_name = 'ticket_rate_limit_per_minute'
+    ) THEN
+        ALTER TABLE tenants RENAME COLUMN ticket_rate_limit_per_minute TO max_tickets_per_second;
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'tenants' AND column_name = 'max_waiting_tickets'
+    ) THEN
+        ALTER TABLE tenants RENAME COLUMN max_waiting_tickets TO max_tickets_in_flight;
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS tickets (
     ticket_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

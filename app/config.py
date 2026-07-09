@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     default_max_waiting_tickets: int = 5000
     default_max_partition_depth: int = 1000
 
+    max_partition_depth: int = 10000
+
     load_shedding_enabled: bool = True
     db_latency_shed_threshold_ms: int = 200
 
