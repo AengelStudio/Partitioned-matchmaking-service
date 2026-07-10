@@ -12,6 +12,7 @@ from uuid import UUID
 import httpx
 from psycopg import Connection
 from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
 from app.callback_dispatcher.http import start_metrics_server
 from app.callback_dispatcher.metrics import CallbackDispatcherMetrics
@@ -19,6 +20,9 @@ from app.config import Settings, get_settings
 from app.db.connection import close_pool, get_pool
 
 logger = logging.getLogger(__name__)
+
+DEADLOCK_MAX_RETRIES = 3
+DEADLOCK_BASE_BACKOFF_SECONDS = 0.01
 
 
 @dataclass(frozen=True)
@@ -139,28 +143,30 @@ def next_backoff_seconds(attempts: int, settings: Settings) -> int:
 
 
 def mark_delivered(conn: Connection, event: CallbackEvent) -> None:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE callback_events
-            SET status = 'delivered',
-                attempts = attempts + 1,
-                locked_by = NULL,
-                locked_until = NULL,
-                last_error = NULL,
-                delivered_at = now()
-            WHERE event_id = %s
-            """,
-            (str(event.event_id),),
-        )
-        cur.execute(
-            """
-            UPDATE matches
-            SET status = 'callback_delivered'
-            WHERE match_id = %s
-            """,
-            (str(event.match_id),),
-        )
+    """Persist delivery. Lock matches before callback_events — same order as the worker."""
+    with conn.transaction():
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE matches
+                SET status = 'callback_delivered'
+                WHERE match_id = %s
+                """,
+                (str(event.match_id),),
+            )
+            cur.execute(
+                """
+                UPDATE callback_events
+                SET status = 'delivered',
+                    attempts = attempts + 1,
+                    locked_by = NULL,
+                    locked_until = NULL,
+                    last_error = NULL,
+                    delivered_at = now()
+                WHERE event_id = %s
+                """,
+                (str(event.event_id),),
+            )
 
 
 def mark_failed_attempt(
@@ -168,46 +174,105 @@ def mark_failed_attempt(
 ) -> bool:
     """Return True when the event has exhausted retries and is final failed."""
     next_attempt = event.attempts + 1
-    if next_attempt >= settings.callback_max_attempts:
+    with conn.transaction():
         with conn.cursor() as cur:
+            if next_attempt >= settings.callback_max_attempts:
+                cur.execute(
+                    """
+                    UPDATE matches
+                    SET status = 'callback_failed'
+                    WHERE match_id = %s
+                    """,
+                    (str(event.match_id),),
+                )
+                cur.execute(
+                    """
+                    UPDATE callback_events
+                    SET status = 'failed',
+                        attempts = attempts + 1,
+                        locked_by = NULL,
+                        locked_until = NULL,
+                        last_error = %s
+                    WHERE event_id = %s
+                    """,
+                    (error, str(event.event_id)),
+                )
+                return True
+
+            backoff = next_backoff_seconds(next_attempt, settings)
             cur.execute(
                 """
                 UPDATE callback_events
-                SET status = 'failed',
+                SET status = 'pending',
                     attempts = attempts + 1,
+                    next_attempt_at = now() + make_interval(secs => %s),
                     locked_by = NULL,
                     locked_until = NULL,
                     last_error = %s
                 WHERE event_id = %s
                 """,
-                (error, str(event.event_id)),
+                (backoff, error, str(event.event_id)),
             )
+    return False
+
+
+def release_claim(conn: Connection, event: CallbackEvent, error: str | None = None) -> None:
+    with conn.transaction():
+        with conn.cursor() as cur:
             cur.execute(
                 """
-                UPDATE matches
-                SET status = 'callback_failed'
-                WHERE match_id = %s
+                UPDATE callback_events
+                SET status = 'pending',
+                    locked_by = NULL,
+                    locked_until = NULL,
+                    last_error = COALESCE(%s, last_error)
+                WHERE event_id = %s
                 """,
-                (str(event.match_id),),
+                (error, str(event.event_id)),
             )
-        return True
 
-    backoff = next_backoff_seconds(next_attempt, settings)
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE callback_events
-            SET status = 'pending',
-                attempts = attempts + 1,
-                next_attempt_at = now() + make_interval(secs => %s),
-                locked_by = NULL,
-                locked_until = NULL,
-                last_error = %s
-            WHERE event_id = %s
-            """,
-            (backoff, error, str(event.event_id)),
-        )
-    return False
+
+def _is_deadlock(exc: BaseException) -> bool:
+    return exc.__class__.__name__ == "DeadlockDetected"
+
+
+def persist_delivery_outcome(
+    pool: ConnectionPool,
+    event: CallbackEvent,
+    settings: Settings,
+    error: str | None,
+) -> bool:
+    """Write delivery outcome with deadlock retries. Returns True if final failed."""
+    last_exc: BaseException | None = None
+    for attempt in range(DEADLOCK_MAX_RETRIES):
+        try:
+            with pool.connection() as conn:
+                if error is None:
+                    mark_delivered(conn, event)
+                    return False
+                return mark_failed_attempt(conn, event, settings, error)
+        except BaseException as exc:
+            if not _is_deadlock(exc) or attempt == DEADLOCK_MAX_RETRIES - 1:
+                last_exc = exc
+                break
+            delay = DEADLOCK_BASE_BACKOFF_SECONDS * (2**attempt) + random.uniform(0, 0.005)
+            logger.warning(
+                "callback_persist_deadlock event_id=%s attempt=%s retry_in_ms=%.1f",
+                event.event_id,
+                attempt + 1,
+                delay * 1000,
+            )
+            time.sleep(delay)
+
+    assert last_exc is not None
+    logger.error(
+        "callback_persist_failed event_id=%s error=%s",
+        event.event_id,
+        last_exc,
+    )
+    with pool.connection() as conn:
+        release_claim(conn, event, str(last_exc)[:500])
+    raise last_exc
 
 
 def deliver_event(
@@ -245,23 +310,34 @@ def run_once(
 
     for event in events:
         error, latency_ms = deliver_event(client, event, settings)
-        with pool.connection() as conn:
-            if error is None:
-                mark_delivered(conn, event)
-                metrics.record_delivered(latency_ms)
-                logger.info("callback_delivered event_id=%s", event.event_id)
-            else:
-                final_failed = mark_failed_attempt(conn, event, settings, error[:500])
-                if final_failed:
-                    metrics.record_failed()
-                else:
-                    metrics.record_retry()
-                logger.warning(
-                    "callback_delivery_failed event_id=%s error=%s",
-                    event.event_id,
-                    error,
-                )
-            conn.commit()
+        try:
+            trimmed_error = error[:500] if error is not None else None
+            final_failed = persist_delivery_outcome(pool, event, settings, trimmed_error)
+        except BaseException as exc:
+            logger.exception(
+                "callback_persist_gave_up event_id=%s exception_type=%s",
+                event.event_id,
+                type(exc).__name__,
+            )
+            continue
+
+        if error is None:
+            metrics.record_delivered(latency_ms)
+            logger.info("callback_delivered event_id=%s", event.event_id)
+        elif final_failed:
+            metrics.record_failed()
+            logger.warning(
+                "callback_delivery_failed event_id=%s error=%s",
+                event.event_id,
+                error,
+            )
+        else:
+            metrics.record_retry()
+            logger.warning(
+                "callback_delivery_failed event_id=%s error=%s",
+                event.event_id,
+                error,
+            )
 
     return len(events)
 
@@ -288,7 +364,11 @@ def main() -> None:
         with httpx.Client() as client:
             while True:
                 loop_start = time.perf_counter()
-                processed = run_once(settings, dispatcher_id, client, metrics)
+                try:
+                    processed = run_once(settings, dispatcher_id, client, metrics)
+                except Exception:
+                    logger.exception("callback_dispatcher_loop_failed")
+                    processed = 0
                 metrics.record_loop((time.perf_counter() - loop_start) * 1000.0)
                 if processed == 0:
                     time.sleep(1.0)

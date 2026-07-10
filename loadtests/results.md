@@ -1,9 +1,22 @@
 # Scale-out benchmark results
 
+## Methodology update (July 2026)
+
+The table below records runs from the **single-tenant** version of `loadtests/scale_out.js`. The script in this repository now rotates across multiple seeded tenants (`studio_a`, `studio_01`–`studio_10`) so aggregate per-tenant quota ceilings can grow with node count. **No GKE re-run was performed for this update.**
+
+For the presentation, use the existing numbers with these takeaways:
+
+- **Scaling metric shown on slides:** p95 ticket-create latency vs node count (314ms → 59ms → 50ms)
+- **Overload stability:** ~90–95% rejection rate under sustained hostile load at every node count
+- **Primary throughput metric (`matches_created_per_second`)** did not scale in the single-tenant runs because per-tenant quotas cap admitted tickets — see headline finding below
+
+Re-run with the updated script using the steps in README "Load Testing" and "Deployment on GKE".
+
+---
+
 Cluster: GKE zonal, `europe-west1-b`, machine type `e2-standard-4`, project `se-proto`.
 Load script: `loadtests/scale_out.js` (unmodified, same 30s/1m/1m/30s ramp to 100 VUs each run).
-Replica counts scale with node count (see README "Deployment on GKE" — this is intentional so the
-benchmark actually exercises more application capacity, not just more idle nodes).
+Replica counts scale with node count via `scripts/scale_k8s_benchmark.sh` (see README "Deployment on GKE").
 
 | Nodes | API / Worker / Dispatcher replicas | Tickets created | Tickets rejected | matches_created_per_second | Tickets:matches ratio | p95 ticket-create latency |
 |-------|-------------------------------------|------------------|-------------------|-------------------------------|------------------------|-----------------------------|
@@ -19,7 +32,7 @@ Two things this benchmark *does* still demonstrate cleanly:
 1. **Overload protection holds under 300+ req/s of sustained hostile load** — 90-95% of requests were correctly rejected with `429`/`503` rather than the system falling over, at every node count.
 2. **p95 latency drops as nodes are added** (314ms → 59ms → 50ms) even though throughput is quota-capped — more API replicas process the same admitted+rejected volume faster in parallel, which is a real (if secondary) scale-out benefit.
 
-**What we didn't get to (documented, not done):** a true `matches_created_per_second` scaling curve requires *multiple tenants* generating load concurrently, so the aggregate quota ceiling — and therefore aggregate ticket/match throughput — actually grows with node count. `loadtests/scale_out.js` would need a pool of seeded tenant IDs rotated per request (similar to the region/queue spread already added). Node pool is currently scaled to 0 (`terraform apply -var node_count=0`, cluster/deployments/Artifact Registry all left intact) to stop billing while this is paused; resuming just needs `terraform apply -var node_count=N` — no rebuild required.
+**What we didn't get to (now addressed in repo, not re-run on GKE):** a true `matches_created_per_second` scaling curve requires *multiple tenants* generating load concurrently. `loadtests/scale_out.js` now rotates a pool of seeded tenant IDs per request. Node pool is currently scaled to 0 (`terraform apply -var node_count=0`, cluster/deployments/Artifact Registry all left intact) to stop billing while this is paused; resuming just needs `terraform apply -var node_count=N` — no rebuild required.
 
 Other implementation notes:
 - The original `scale_out.js` sent every ticket with the same `(tenant_id, region, queue_name)`, which per `app/shared/partition.py` hashes to a single fixed partition — so only one worker could ever process matches, regardless of replica count. Fixed by spreading requests across 5 regions × 3 queues (15 partitions). The 1-node row above predates this fix and is kept only for the latency comparison; its throughput numbers aren't comparable to the 3/5-node rows.

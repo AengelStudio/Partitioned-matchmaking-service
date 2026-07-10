@@ -9,19 +9,30 @@
 // the run duration.
 //
 // partition_id = hash(tenant_id + region + queue_name) % MATCHMAKING_PARTITIONS
-// (see app/shared/partition.py) — a single (tenant, region, queue) tuple
-// always lands on exactly one partition, so it can only ever be worked by
-// whichever single worker holds that one lease, no matter how many worker
-// replicas exist. Spread requests across multiple (region, queue) pairs so
-// the run actually touches enough partitions to exercise more than one
-// worker — otherwise this benchmark cannot show worker-side scale-out at
-// all, regardless of node count.
+// (see app/shared/partition.py). Spread requests across tenants, regions,
+// and queues so aggregate quota ceilings grow with node count.
+//
+// Note: loadtests/results.md table rows used the older single-tenant
+// script. This version rotates tenants for reproducible multi-tenant runs.
 import http from "k6/http";
 import { check, sleep } from "k6";
 import { Counter, Trend } from "k6/metrics";
 
 const BASE_URL = __ENV.BASE_URL || "http://localhost:8080";
-const TENANT_ID = __ENV.TENANT_ID || "studio_a";
+
+const TENANTS = [
+  "studio_a",
+  "studio_01",
+  "studio_02",
+  "studio_03",
+  "studio_04",
+  "studio_05",
+  "studio_06",
+  "studio_07",
+  "studio_08",
+  "studio_09",
+  "studio_10",
+];
 
 const REGIONS = ["eu-west", "eu-central", "us-east", "us-west", "ap-southeast"];
 const QUEUES = ["ranked_1v1", "ranked_2v2", "casual_1v1"];
@@ -49,7 +60,8 @@ export const options = {
 };
 
 export default function () {
-  const playerId = `player-${__VU}-${__ITER}`;
+  const tenantId = TENANTS[(__VU + __ITER) % TENANTS.length];
+  const playerId = `player-${tenantId}-${__VU}-${__ITER}`;
   const region = REGIONS[(__VU + __ITER) % REGIONS.length];
   const queueName = QUEUES[__VU % QUEUES.length];
   const payload = JSON.stringify({
@@ -62,8 +74,8 @@ export default function () {
   const params = {
     headers: {
       "Content-Type": "application/json",
-      "X-Tenant-Id": TENANT_ID,
-      "Idempotency-Key": `${TENANT_ID}-${__VU}-${__ITER}-${Date.now()}`,
+      "X-Tenant-Id": tenantId,
+      "Idempotency-Key": `${tenantId}-${__VU}-${__ITER}-${Date.now()}`,
     },
   };
 

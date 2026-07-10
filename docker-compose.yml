@@ -39,6 +39,18 @@ services:
     env_file: .env
     ports:
       - "8080:8080"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -49,6 +61,20 @@ services:
     build: .
     command: ["sh", "-c", "WORKER_ID=$$(hostname) python -m app.worker.main"]
     env_file: .env
+    ports:
+      - "9090-9095:9090"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:9090/health')",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -57,13 +83,15 @@ services:
 
   callback-dispatcher:
     build: .
-    command: python -m app.callback_dispatcher.main
+    command: ["sh", "-c", "CALLBACK_DISPATCHER_ID=$$(hostname) python -m app.callback_dispatcher.main"]
     env_file: .env
     ports:
       - "9091:9091"
     depends_on:
       migrate:
         condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
 
   mock-callback:
     build: .
@@ -71,3 +99,17 @@ services:
     env_file: .env
     ports:
       - "9000:9000"
+
+  k6:
+    image: grafana/k6:0.57.0
+    profiles:
+      - loadtest
+    volumes:
+      - ./loadtests:/scripts:ro
+    environment:
+      BASE_URL: http://api:8080
+    depends_on:
+      api:
+        condition: service_healthy
+      worker:
+        condition: service_healthy
