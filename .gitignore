@@ -220,3 +220,8 @@ __marimo__/
 
 # Section B local Cursor rules (not shared in repo)
 section-b/
+
+#Terraform
+infra/terraform/.terraform/
+infra/terraform/terraform.tfstate
+infra/terraform/terraform.tfstate.backup

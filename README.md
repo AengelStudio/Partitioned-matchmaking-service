@@ -82,40 +82,88 @@ Invoke-RestMethod -Uri http://localhost:8080/v1/tickets -Method POST `
 
 On Linux/Mac, use `curl` instead of `curl.exe`.
 
-## Worker Observability
+## Deployment on GKE
 
-The matchmaking worker exposes `/health` and `/metrics` on `WORKER_METRICS_PORT` (default `9090`). Metrics answer where time is spent per loop, whether leases/reservations are healthy, the match creation rate, and which stage is causing a backlog.
+This reproduces the 1-node / 3-node / 5-node scalability benchmark. All commands below assume a shell with `gcloud`, `terraform`, `docker`, and `kubectl` installed and authenticated (`gcloud auth login` and `gcloud auth application-default login`).
 
-**Health check**
-
-```powershell
-curl.exe http://localhost:9090/health
-```
-
-**Raw metrics**
-
-```powershell
-curl.exe http://localhost:9090/metrics
-```
-
-**Watch key counters change under load**
-
-```powershell
-while ($true) { curl.exe -s http://localhost:9090/metrics | Select-String "matches_created_total|matches_failed_total|loop_duration_ms|pair_search_ms|match_creation_ms"; Start-Sleep -Seconds 2 }
-```
-
-On Linux/Mac:
+### 1. Provision the cluster
 
 ```bash
-watch -n 2 'curl -s http://localhost:9090/metrics | grep -E "matches_created_total|matches_failed_total|loop_duration_ms|pair_search_ms|match_creation_ms"'
+cd infra/terraform
+terraform init
+terraform apply -var="node_count=1"
 ```
 
-**Validation script**
+`node_count` is the only thing you change between benchmark runs (`1`, `3`, or `5`); `machine_type` must stay the same across those three runs so the comparison is fair. See `infra/terraform/variables.tf` for all tunables.
 
-`scripts/validate_worker_metrics.py` checks that every expected metric name is present on `/metrics` and reports counter deltas across a sample interval, useful for confirming a worker is actually making progress under load:
+Point `kubectl` at the new cluster (Terraform prints this exact command as an output):
 
-```powershell
-python scripts/validate_worker_metrics.py --host localhost --port 9090 --interval 5
+```bash
+$(terraform output -raw get_credentials_command)
 ```
 
-Set `LOG_LEVEL=info` (in `.env`) to see structured per-stage logs such as `partitions_claimed`, `tickets_fetched`, `pair_search_completed`, `match_created`, and `match_creation_failed`, each tagged with `worker_id`, partition id(s), and ticket/match identifiers.
+### 2. Build and push the image
+
+```bash
+REGISTRY=$(terraform output -raw artifact_registry_repository)
+gcloud auth configure-docker "${REGISTRY%%/*}"
+docker build -t "$REGISTRY/pms:local" .
+docker push "$REGISTRY/pms:local"
+```
+
+Then update the `image:` field in `infra/k8s/api.yaml`, `worker.yaml`, `callback-dispatcher.yaml`, and `migrate-job.yaml` from the local placeholder `pms:local` to `$REGISTRY/pms:local`.
+
+### 3. Create secrets and deploy
+
+```bash
+kubectl apply -f infra/k8s/namespace.yaml
+kubectl create secret generic pms-secrets --namespace pms \
+  --from-literal=DATABASE_URL='postgresql://pms:REPLACE_ME@postgres:5432/pms' \
+  --from-literal=POSTGRES_PASSWORD='REPLACE_ME' \
+  --dry-run=client -o yaml | kubectl apply -f -
+kubectl apply -f infra/k8s/configmap.yaml
+kubectl apply -f infra/k8s/postgres.yaml -f infra/k8s/redis.yaml
+kubectl -n pms wait --for=condition=ready pod -l app=postgres --timeout=120s
+kubectl apply -f infra/k8s/migrate-job.yaml
+kubectl -n pms wait --for=condition=complete job/pms-migrate --timeout=120s
+kubectl apply -f infra/k8s/api.yaml -f infra/k8s/worker.yaml -f infra/k8s/callback-dispatcher.yaml
+kubectl apply -f infra/k8s/ingress.yaml
+```
+
+`infra/k8s/secret.yaml` is a template only (see the comments in that file) — the `kubectl create secret ... --dry-run=client | kubectl apply -f -` line above is the real, non-committed secret creation step. Replace `REPLACE_ME` with the actual Postgres password before running it.
+
+Insert at least one tenant with a real `callback_url`/`callback_secret` directly into Postgres before running load tests, since there is no admin API for tenant management yet:
+
+```bash
+kubectl -n pms exec -it statefulset/postgres -- psql -U pms -d pms -c \
+  "INSERT INTO tenants (tenant_id, name, callback_url, callback_secret) VALUES ('studio_a', 'Studio A', 'http://mock-callback:9000/tenant-matchmaking-callback', 'REPLACE_ME');"
+```
+
+### 4. Confirm it's up
+
+```bash
+kubectl -n pms get pods
+kubectl -n pms get ingress pms-api
+curl "http://$(kubectl -n pms get ingress pms-api -o jsonpath='{.status.loadBalancer.ingress[0].ip}')/health"
+```
+
+GCE ingress can take several minutes to get a public IP after `kubectl apply` — re-run the `get ingress` command until `ADDRESS` is populated.
+
+### 5. Run the benchmark, then tear down
+
+```bash
+k6 run loadtests/scale_out.js   # see the load-testing section below
+terraform destroy               # do this after every run — the cluster bills by the hour
+```
+
+Repeat steps 1-5 with `node_count=3` and `node_count=5` (same `machine_type`) to get the three comparison points. **Always run `terraform destroy` when you're done for the day** — this project has a fixed $50 GCP grant and a forgotten cluster burns through it in days, not weeks.
+
+### Node identity in Kubernetes
+
+`WORKER_ID` and `CALLBACK_DISPATCHER_ID` are set from each pod's own name via `fieldRef` in `infra/k8s/worker.yaml` and `infra/k8s/callback-dispatcher.yaml`, so replicas never collide on identity — no manual configuration needed when scaling `kubectl scale deployment/worker --replicas=N`.
+
+### Known limitations
+
+- No autoscaling anywhere on purpose (node pool, HPA, Autopilot) — node and pod counts are fixed and manually controlled for reproducible benchmark comparisons.
+- The tenant table has no admin API yet; tenants are inserted directly via `psql` (see step 3).
+- `infra/k8s/secret.yaml` is a template, not a real secret — see the comment at the top of that file.

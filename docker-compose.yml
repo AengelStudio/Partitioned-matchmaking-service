@@ -59,6 +59,8 @@ services:
     build: .
     command: python -m app.callback_dispatcher.main
     env_file: .env
+    ports:
+      - "9091:9091"
     depends_on:
       migrate:
         condition: service_completed_successfully
