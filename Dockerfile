@@ -10,6 +10,7 @@ RUN pip install --no-cache-dir ".[dev]"
 
 COPY app/ app/
 COPY tests/ tests/
+COPY scripts/ scripts/
 
 EXPOSE 8080
 

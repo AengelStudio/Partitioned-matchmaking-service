@@ -31,8 +31,13 @@ class Settings(BaseSettings):
     worker_metrics_port: int = 9090
     worker_lease_seconds: int = 15
     worker_loop_interval_ms: int = 500
+    worker_loop_jitter_pct: float = 0.25
+    worker_lease_renew_jitter_pct: float = 0.1
     worker_partition_batch_size: int = 8
     worker_ticket_batch_size: int = 100
+    worker_loop_budget_ms: int = 2000
+    worker_max_pairs_per_loop: int = 20
+    worker_freshness_bias: bool = True
 
     match_size: int = 2
     skill_delta_initial: int = 100

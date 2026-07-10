@@ -420,11 +420,52 @@ Prometheus-style plain text counters:
 ```text
 pms_worker_info{worker_id="worker-local-1"} 1
 pms_worker_matches_created_total{worker_id="worker-local-1"} 12
+pms_worker_matches_failed_total{worker_id="worker-local-1"} 1
+pms_worker_rollbacks_total{worker_id="worker-local-1"} 1
 pms_worker_leases_claimed_total{worker_id="worker-local-1"} 40
+pms_worker_leases_renewed_total{worker_id="worker-local-1"} 812
+pms_worker_lease_claim_failures_total{worker_id="worker-local-1"} 0
 pms_worker_reservations_expired_total{worker_id="worker-local-1"} 0
+pms_worker_reservations_cleaned_total{worker_id="worker-local-1"} 0
+pms_worker_pair_search_runs_total{worker_id="worker-local-1"} 260
 pms_worker_loop_duration_ms{worker_id="worker-local-1"} 4.10
 pms_worker_loops_completed_total{worker_id="worker-local-1"} 260
+pms_worker_tickets_fetched_total{worker_id="worker-local-1"} 5400
+pms_worker_pairs_found_total{worker_id="worker-local-1"} 130
+pms_worker_pairs_skipped_total{worker_id="worker-local-1"} 6
+pms_worker_loop_budget_exceeded_total{worker_id="worker-local-1"} 2
+pms_worker_owned_partitions_count{worker_id="worker-local-1"} 16
+pms_worker_tickets_fetched_last_loop{worker_id="worker-local-1"} 100
+pms_worker_pairs_found_last_loop{worker_id="worker-local-1"} 22
+pms_worker_matches_created_last_loop{worker_id="worker-local-1"} 20
+pms_worker_max_ticket_wait_seconds{worker_id="worker-local-1"} 41.30
+pms_worker_avg_ticket_wait_seconds{worker_id="worker-local-1"} 12.85
+pms_worker_jittered_sleep_ms{worker_id="worker-local-1"} 517.00
+pms_worker_lease_ops_ms{worker_id="worker-local-1"} 3.20
+pms_worker_lease_ops_ms_sum{worker_id="worker-local-1"} 832.00
+pms_worker_lease_ops_ms_count{worker_id="worker-local-1"} 260
+pms_worker_ticket_fetch_ms{worker_id="worker-local-1"} 2.10
+pms_worker_ticket_fetch_ms_sum{worker_id="worker-local-1"} 546.00
+pms_worker_ticket_fetch_ms_count{worker_id="worker-local-1"} 260
+pms_worker_pair_search_ms{worker_id="worker-local-1"} 5.40
+pms_worker_pair_search_ms_sum{worker_id="worker-local-1"} 1404.00
+pms_worker_pair_search_ms_count{worker_id="worker-local-1"} 260
+pms_worker_match_creation_ms{worker_id="worker-local-1"} 8.90
+pms_worker_match_creation_ms_sum{worker_id="worker-local-1"} 2314.00
+pms_worker_match_creation_ms_count{worker_id="worker-local-1"} 260
 ```
+
+`worker_pairs_skipped_total` and `worker_loop_budget_exceeded_total` indicate a worker is hitting `WORKER_LOOP_BUDGET_MS` / `WORKER_MAX_PAIRS_PER_LOOP` caps and shedding excess pairs to the next loop rather than growing an unbounded backlog.
+
+`pms_worker_jittered_sleep_ms` reports the per-loop sleep duration each replica actually uses. It is derived deterministically from `WORKER_ID` and `WORKER_LOOP_JITTER_PCT`, so it stays the same across restarts of the same replica but differs between replicas, preventing every worker from waking up, renewing leases, and hitting PostgreSQL at the exact same moment.
+
+The `_ms` / `_ms_sum` / `_ms_count` triples (`lease_ops_ms`, `ticket_fetch_ms`, `pair_search_ms`, `match_creation_ms`) break the loop down by stage: `_ms` is the most recent duration, `_ms_sum` divided by `_ms_count` gives the average duration per loop for that stage. Comparing these across stages answers "where is time spent?" and which stage is causing a growing backlog.
+
+`pms_worker_leases_renewed_total`, `pms_worker_lease_claim_failures_total`, `pms_worker_reservations_cleaned_total` (an alias of `reservations_expired_total`), and `pms_worker_owned_partitions_count` answer "are leases/reservations healthy?". `pms_worker_matches_failed_total` and `pms_worker_rollbacks_total` count reservation conflicts and failed match transactions, so `matches_created_total` alone is not mistaken for a 100% success rate.
+
+Structured worker logs (`partitions_claimed`, `partitions_released`, `reservations_cleaned`, `tickets_fetched`, `pair_search_completed`, `match_created`, `match_creation_failed`, `worker_lease_ops_failed`) include `worker_id`, `partition_id`/`partition_ids`, ticket counts, `match_id`, and `exception_type` where relevant. They are emitted at `INFO`/`ERROR` level; set `LOG_LEVEL=info` to see them.
+
+Validate the endpoint under load with `python scripts/validate_worker_metrics.py --host localhost --port 9090`, see the README for details.
 
 ---
 
@@ -454,8 +495,13 @@ WORKER_METRICS_HOST=0.0.0.0
 WORKER_METRICS_PORT=9090
 WORKER_LEASE_SECONDS=15
 WORKER_LOOP_INTERVAL_MS=500
+WORKER_LOOP_JITTER_PCT=0.25
+WORKER_LEASE_RENEW_JITTER_PCT=0.1
 WORKER_PARTITION_BATCH_SIZE=8
 WORKER_TICKET_BATCH_SIZE=100
+WORKER_LOOP_BUDGET_MS=2000
+WORKER_MAX_PAIRS_PER_LOOP=20
+WORKER_FRESHNESS_BIAS=true
 
 MATCH_SIZE=2
 SKILL_DELTA_INITIAL=100

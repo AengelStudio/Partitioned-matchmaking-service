@@ -101,6 +101,8 @@ ticket reservation with reserved_until
 graceful degradation of skill range over waiting time
 expired reservation cleanup
 insert callback event when match is created
+bounded per-loop work budget to prevent insurmountable backlog
+freshness-biased ticket fetch under backlog
 ```
 
 Chronological TODO:
@@ -125,10 +127,28 @@ Chronological TODO:
 17. Update matched tickets with status = matched and match_id.
 18. Insert a callback_events row when a match is created.
 19. Ensure match creation and callback event insertion happen in one transaction.
-20. Add worker metrics: matches_created, loop_duration, leases_claimed, reservation_expired.
+20. [DONE] Add worker metrics: matches_created, loop_duration, leases_claimed, reservation_expired.
 21. Test with manually seeded tickets.
 22. Test with multiple worker processes running at the same time.
 23. Test worker crash behavior by killing a worker and waiting for lease expiry.
+24. [DONE] Add a per-loop time budget (worker_loop_budget_ms) and max pairs cap (worker_max_pairs_per_loop) so a single loop cannot process an unbounded amount of work.
+25. [DONE] Add freshness-biased ticket fetching (worker_freshness_bias) that mixes newest and oldest waiting tickets instead of always draining oldest-first, so fresh traffic keeps getting matched during a backlog.
+26. [DONE] Add optional max_wait_seconds filter in fetch_waiting_tickets to exclude very old tickets from a fetch when backlog is detected.
+27. [DONE] Extend worker metrics with backlog/age signals: tickets_fetched_total, pairs_found_total, pairs_skipped_total, loop_budget_exceeded_total, and last-loop/age gauges (tickets_fetched_last_loop, pairs_found_last_loop, matches_created_last_loop, max_ticket_wait_seconds, avg_ticket_wait_seconds).
+28. [DONE] Add deterministic per-worker jitter (worker_loop_jitter_pct, worker_lease_renew_jitter_pct) to loop sleep and lease renewal timing so replicas don't stay lock-step.
+29. [DONE] Randomize partition claim order per worker using a deterministic worker offset to reduce contention on low-numbered partitions.
+30. [DONE] Add stage timing metrics (lease_ops_ms, ticket_fetch_ms, pair_search_ms, match_creation_ms) so backlog root cause can be attributed to a specific loop stage.
+31. [DONE] Add failure/rollback counters (lease_claim_failures, matches_failed, rollbacks) and a leases_renewed counter, distinct from success-only counters.
+32. [DONE] Add structured logging with worker_id, partition_id(s), ticket counts, match_id, and exception type on lease claim failures, match creation failures, and per-partition ticket fetch summaries.
+33. [DONE] Add scripts/validate_worker_metrics.py to check /metrics exposes all expected metric names and to report counter deltas across a sample interval.
+```
+
+Backlog behavior notes:
+
+```text
+Ticket batches are bounded by worker_ticket_batch_size, and match creation within a loop is bounded by worker_loop_budget_ms (wall-clock) and worker_max_pairs_per_loop (count), so one loop can no longer balloon into a long "catch-up" pass.
+When worker_freshness_bias is enabled (default), each fetch pulls roughly half of its batch from the newest waiting tickets and half from the oldest, so new arrivals keep getting matched even while a backlog of old tickets is present.
+When a loop hits its time budget or pair cap, it logs worker_backlog_loop with tickets_fetched, pairs_found, pairs_skipped, and ticket age stats, and increments pms_worker_loop_budget_exceeded_total / pms_worker_pairs_skipped_total so backlog pressure is visible in metrics.
 ```
 
 Core milestones:
