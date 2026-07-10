@@ -7,12 +7,24 @@
 // computed here — read pms_worker_matches_created_total from the
 // worker's /metrics endpoint before and after the run and divide by
 // the run duration.
+//
+// partition_id = hash(tenant_id + region + queue_name) % MATCHMAKING_PARTITIONS
+// (see app/shared/partition.py) — a single (tenant, region, queue) tuple
+// always lands on exactly one partition, so it can only ever be worked by
+// whichever single worker holds that one lease, no matter how many worker
+// replicas exist. Spread requests across multiple (region, queue) pairs so
+// the run actually touches enough partitions to exercise more than one
+// worker — otherwise this benchmark cannot show worker-side scale-out at
+// all, regardless of node count.
 import http from "k6/http";
 import { check, sleep } from "k6";
 import { Counter, Trend } from "k6/metrics";
 
 const BASE_URL = __ENV.BASE_URL || "http://localhost:8080";
 const TENANT_ID = __ENV.TENANT_ID || "studio_a";
+
+const REGIONS = ["eu-west", "eu-central", "us-east", "us-west", "ap-southeast"];
+const QUEUES = ["ranked_1v1", "ranked_2v2", "casual_1v1"];
 
 const ticketsCreated = new Counter("tickets_created");
 const ticketsRejected = new Counter("tickets_rejected");
@@ -38,10 +50,12 @@ export const options = {
 
 export default function () {
   const playerId = `player-${__VU}-${__ITER}`;
+  const region = REGIONS[(__VU + __ITER) % REGIONS.length];
+  const queueName = QUEUES[__VU % QUEUES.length];
   const payload = JSON.stringify({
     player_id: playerId,
-    region: "eu-west",
-    queue_name: "ranked_1v1",
+    region: region,
+    queue_name: queueName,
     skill: 1000 + Math.floor(Math.random() * 800),
   });
 
