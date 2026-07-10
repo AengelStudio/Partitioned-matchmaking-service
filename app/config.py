@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     callback_metrics_host: str = "0.0.0.0"
     callback_metrics_port: int = 9091
     callback_batch_size: int = 50
+    callback_tenant_concurrency_limit: int = 10
     callback_timeout_seconds: int = 3
     callback_max_attempts: int = 5
     callback_base_backoff_seconds: int = 2

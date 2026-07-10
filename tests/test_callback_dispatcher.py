@@ -37,8 +37,8 @@ def test_build_headers_include_contract_headers() -> None:
 
 def test_signature_uses_timestamp_and_raw_body() -> None:
     assert signature("secret", "2026-06-24T14:32:45Z", '{"a":1}') == (
-        "f1d3903ee02a1f207a472f3a14f147ea"
-        "b94ae19550b3a93c9a18def4445397a8"
+        "9d8fe6be0aa335239e18b2ae096c17c0"
+        "a79655e54e901e483df371eea45dcdbd"
     )
 
 

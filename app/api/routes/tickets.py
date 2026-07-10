@@ -10,7 +10,9 @@ from app.core.admission import (
 from app.core.idempotency import (
     check_idempotency_key,
     compute_request_hash,
-    store_idempotency_key,
+    fetch_stored_response,
+    finalize_idempotency_key,
+    reserve_idempotency_key,
 )
 from app.core.metrics import (
     active_tickets,
@@ -99,6 +101,29 @@ async def create_ticket(
     try:
         async with pool.acquire() as conn:
             async with conn.transaction():
+                if idempotency_key is not None:
+                    reserved = await reserve_idempotency_key(
+                        conn, idempotency_key, tenant_id, request_hash
+                    )
+                    if not reserved:
+                        # Another concurrent request with the same key won
+                        # the race. Postgres blocked our reservation attempt
+                        # until that request's transaction committed, so its
+                        # stored response is guaranteed to be visible now.
+                        _, stored_response, hash_matched = await fetch_stored_response(
+                            conn, idempotency_key, tenant_id, request_hash
+                        )
+                        if hash_matched:
+                            replay = {**stored_response, "idempotent_replay": True}
+                            return JSONResponse(status_code=200, content=replay)
+                        return JSONResponse(
+                            status_code=409,
+                            content={
+                                "error": "idempotency_key_conflict",
+                                "message": "This idempotency key was already used with a different request body.",
+                            },
+                        )
+
                 row = await conn.fetchrow(
                     """INSERT INTO tickets
                            (tenant_id, player_id, region, queue_name, skill, partition_id, status)
@@ -120,11 +145,10 @@ async def create_ticket(
                 active_tickets.labels(tenant_id=tenant_id, partition_id=str(partition_id)).inc()
 
                 if idempotency_key is not None:
-                    await store_idempotency_key(
+                    await finalize_idempotency_key(
                         conn,
                         idempotency_key,
                         tenant_id,
-                        request_hash,
                         201,
                         response_body,
                         row["ticket_id"],

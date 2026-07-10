@@ -45,16 +45,38 @@ def claim_callback_events(
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
-            WITH candidates AS (
-                SELECT event_id
+            WITH in_flight AS (
+                SELECT tenant_id, count(*) AS cnt
+                FROM callback_events
+                WHERE status = 'in_progress' AND locked_until > now()
+                GROUP BY tenant_id
+            ),
+            ranked AS (
+                SELECT event_id, tenant_id,
+                       row_number() OVER (
+                           PARTITION BY tenant_id
+                           ORDER BY next_attempt_at, created_at
+                       ) AS rn
                 FROM callback_events
                 WHERE (
                     status = 'pending'
                     OR (status = 'in_progress' AND locked_until <= now())
                 )
                   AND next_attempt_at <= now()
-                ORDER BY next_attempt_at, created_at
+            ),
+            eligible AS (
+                SELECT r.event_id
+                FROM ranked AS r
+                LEFT JOIN in_flight AS f ON f.tenant_id = r.tenant_id
+                WHERE r.rn <= (%s - COALESCE(f.cnt, 0))
+                ORDER BY r.rn
                 LIMIT %s
+            ),
+            candidates AS (
+                SELECT event_id
+                FROM callback_events
+                WHERE event_id IN (SELECT event_id FROM eligible)
+                ORDER BY event_id
                 FOR UPDATE SKIP LOCKED
             )
             UPDATE callback_events AS ce
@@ -77,6 +99,7 @@ def claim_callback_events(
                       ) AS callback_secret
             """,
             (
+                settings.callback_tenant_concurrency_limit,
                 settings.callback_batch_size,
                 dispatcher_id,
                 settings.callback_timeout_seconds,
