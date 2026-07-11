@@ -165,8 +165,11 @@ Repeat steps 1-5 with `node_count=3` and `node_count=5` (same `machine_type`) to
 `scripts/run_gke_benchmark.py` (via `scripts/run_gke_benchmark.cmd`) automates the full cycle: resize the node pool, deploy manifests (unless already up), scale replicas, run `loadtests/scale_out.js` through **GCE ingress**, write results to `loadtests/results-gke-<timestamp>.md`, then scale nodes back to **0**.
 
 ```powershell
-$env:PMS_POSTGRES_PASSWORD = "your-postgres-password"
+# Postgres password is read from PG_PASS in .env (or PMS_POSTGRES_PASSWORD env var)
 $env:USE_GKE_GCLOUD_AUTH_PLUGIN = "True"
+
+# Quick sanity check (~5s) before build/deploy
+scripts\run_gke_benchmark.cmd preflight
 
 # 1-node run (~5 min including deploy + 3 min k6)
 scripts\run_gke_benchmark.cmd 1
