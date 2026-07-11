@@ -27,6 +27,11 @@ def conn():
 def _clear_partition(conn, partition_id: int) -> None:
     with conn.cursor() as cur:
         cur.execute(
+            "DELETE FROM idempotency_keys WHERE ticket_id IN "
+            "(SELECT ticket_id FROM tickets WHERE partition_id = %s)",
+            (partition_id,),
+        )
+        cur.execute(
             "DELETE FROM match_players WHERE match_id IN "
             "(SELECT match_id FROM matches WHERE partition_id = %s)",
             (partition_id,),

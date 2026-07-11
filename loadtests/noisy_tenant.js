@@ -1,8 +1,8 @@
 // Noisy-tenant fairness test: one tenant hammers the API far harder
-// than another. If tenant quotas, queue-depth limits, and per-tenant
-// callback concurrency are working, the quiet tenant's success rate
-// and latency should stay roughly stable regardless of how noisy the
-// other tenant gets.
+// than another. If per-tenant quotas are working, the quiet tenant's
+// success rate and latency should stay stable regardless of how noisy
+// the other tenant gets. studio_quiet is seeded with the default
+// ticket_rate_limit (300/min); this scenario offers 5 req/s (~300/min).
 import http from "k6/http";
 import { check, sleep } from "k6";
 import { Rate, Trend } from "k6/metrics";

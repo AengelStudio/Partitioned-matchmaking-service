@@ -9,6 +9,11 @@ def compute_request_hash(body: bytes) -> str:
     return hashlib.sha256(body).hexdigest()
 
 
+def compute_request_hash_from_model(body: dict) -> str:
+    canonical = json.dumps(body, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
 async def fetch_stored_response(
     conn: asyncpg.Connection, key: str, tenant_id: str, request_hash: str
 ) -> tuple[bool, dict | None, bool]:

@@ -1,0 +1,60 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-callback
+  namespace: pms
+spec:
+  selector:
+    app: mock-callback
+  ports:
+    - port: 9000
+      targetPort: 9000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-callback
+  namespace: pms
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mock-callback
+  template:
+    metadata:
+      labels:
+        app: mock-callback
+    spec:
+      containers:
+        - name: mock-callback
+          image: pms:local
+          command:
+            [
+              "uvicorn",
+              "app.mock_callback.main:app",
+              "--host",
+              "0.0.0.0",
+              "--port",
+              "9000",
+            ]
+          ports:
+            - containerPort: 9000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "250m"
+              memory: "256Mi"

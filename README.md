@@ -6,6 +6,8 @@ A prototype B2B matchmaking backend for multiplayer game studios. Studios submit
 
 The project focuses on scalability. It separates stateless API components from stateful queue/match storage, supports horizontal scaling through replicated API and worker pods, and includes overload protection so scaling one component does not overload another.
 
+Licensed for non-commercial use only — see [`LICENSE`](LICENSE).
+
 ## Tech Stack
 
 - Python 3.12

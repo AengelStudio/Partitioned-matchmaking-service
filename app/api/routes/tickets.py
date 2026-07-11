@@ -1,15 +1,16 @@
 import asyncpg
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import JSONResponse
 
 from app.core.admission import (
+    check_db_load_shedding,
     check_partition_depth,
     check_rate_limit,
     check_tenant_quota,
 )
 from app.core.idempotency import (
     check_idempotency_key,
-    compute_request_hash,
+    compute_request_hash_from_model,
     fetch_stored_response,
     finalize_idempotency_key,
     reserve_idempotency_key,
@@ -55,7 +56,6 @@ def _ticket_response(row: dict, *, idempotent_replay: bool = False) -> TicketRes
 
 @router.post("/tickets", response_model=TicketResponse, status_code=201, response_model_exclude_none=True)
 async def create_ticket(
-    request: Request,
     body: TicketCreate,
     tenant: dict = Depends(require_tenant),
     idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
@@ -65,7 +65,7 @@ async def create_ticket(
     request_hash = None
 
     if idempotency_key is not None:
-        request_hash = compute_request_hash(await request.body())
+        request_hash = compute_request_hash_from_model(body.model_dump())
         found, stored_response, hash_matched = await check_idempotency_key(
             pool, idempotency_key, tenant_id, request_hash
         )
@@ -93,9 +93,13 @@ async def create_ticket(
     if rejection is not None:
         tickets_rejected_total.labels(tenant_id=tenant_id, reason="tenant_quota").inc()
         return rejection
-    rejection = await check_partition_depth(pool, partition_id)
+    rejection = await check_partition_depth(pool, tenant, partition_id)
     if rejection is not None:
         tickets_rejected_total.labels(tenant_id=tenant_id, reason="partition_overload").inc()
+        return rejection
+    rejection = await check_db_load_shedding(pool)
+    if rejection is not None:
+        tickets_rejected_total.labels(tenant_id=tenant_id, reason="load_shedding").inc()
         return rejection
 
     try:
