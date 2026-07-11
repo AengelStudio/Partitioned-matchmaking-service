@@ -160,6 +160,26 @@ terraform destroy               # do this after every run — the cluster bills 
 
 Repeat steps 1-5 with `node_count=3` and `node_count=5` (same `machine_type`) to get the three comparison points. **Always run `terraform destroy` when you're done for the day** — this project has a fixed $50 GCP grant and a forgotten cluster burns through it in days, not weeks.
 
+### Automated benchmark (boot → test → scale to 0)
+
+`scripts/run_gke_benchmark.py` (via `scripts/run_gke_benchmark.cmd`) automates the full cycle: resize the node pool, deploy manifests (unless already up), scale replicas, run `loadtests/scale_out.js` through **GCE ingress**, write results to `loadtests/results-gke-<timestamp>.md`, then scale nodes back to **0**.
+
+```powershell
+$env:PMS_POSTGRES_PASSWORD = "your-postgres-password"
+$env:USE_GKE_GCLOUD_AUTH_PLUGIN = "True"
+
+# 1-node run (~5 min including deploy + 3 min k6)
+scripts\run_gke_benchmark.cmd 1
+
+# Already deployed and image pushed — benchmark only
+scripts\run_gke_benchmark.cmd 1 skip
+
+# Full 1 / 3 / 5 comparison (~20+ min, higher cost)
+scripts\run_gke_benchmark.cmd all skip
+```
+
+Requires `gcloud`, `kubectl`, `docker`, `k6`, and `py` on PATH. Uses **GCE ingress** for k6 traffic by default (port-forward cannot handle 100 VUs). Pass `--skip-teardown` to leave nodes running after the run.
+
 ### Node identity in Kubernetes
 
 `WORKER_ID` and `CALLBACK_DISPATCHER_ID` are set from each pod's own name via `fieldRef` in `infra/k8s/worker.yaml` and `infra/k8s/callback-dispatcher.yaml`, so replicas never collide on identity — no manual configuration needed when scaling `kubectl scale deployment/worker --replicas=N`.

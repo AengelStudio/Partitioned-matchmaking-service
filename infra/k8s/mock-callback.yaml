@@ -27,7 +27,7 @@ spec:
     spec:
       containers:
         - name: mock-callback
-          image: pms:local
+          image: europe-west1-docker.pkg.dev/se-proto/pms/pms:local
           command:
             [
               "uvicorn",

@@ -27,7 +27,7 @@ spec:
     spec:
       containers:
         - name: api
-          image: pms:local
+          image: europe-west1-docker.pkg.dev/se-proto/pms/pms:local
           command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
           ports:
             - containerPort: 8080

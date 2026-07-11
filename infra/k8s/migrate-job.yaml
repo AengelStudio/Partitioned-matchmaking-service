@@ -10,7 +10,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: migrate
-          image: pms:local
+          image: europe-west1-docker.pkg.dev/se-proto/pms/pms:local
           command: ["python", "-m", "app.db.init"]
           envFrom:
             - configMapRef:
