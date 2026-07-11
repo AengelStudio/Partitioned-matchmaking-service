@@ -19,10 +19,39 @@ from pathlib import Path
 from typing import Callable, TypeVar
 
 ROOT = Path(__file__).resolve().parents[1]
+ENV_FILE = ROOT / ".env"
 K6_DURATION_SECONDS = 180
+K6_SMOKE_DURATION_SECONDS = 120
+INGRESS_ERROR_CHECK_GRACE_SECONDS = 90
+PLACEHOLDER_PASSWORDS = frozenset(
+    {"", "replace_me", "changeme", "your-postgres-password", "your-password"}
+)
+INGRESS_FATAL_PATTERNS = (
+    "error syncing load balancer",
+    "quota exceeded",
+    "failed to create",
+    "does not have any active node",
+    "does not exist",
+    "no healthy upstream",
+    "backendconfig",
+    "invalid resource",
+    "permission denied",
+    "insufficient",
+)
 METRIC_LINE = re.compile(
     r"^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+(?P<value>-?[0-9.eE+]+)$"
 )
+LABELED_METRIC_LINE = re.compile(
+    r"^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)\{(?P<labels>[^}]*)\}\s+(?P<value>-?[0-9.eE+]+)$"
+)
+METRIC_LABEL_KV = re.compile(r'(\w+)="((?:\\.|[^"\\])*)"')
+REJECTION_REASON_ORDER = ("rate_limit", "tenant_quota", "partition_overload", "load_shedding")
+REJECTION_REASON_HTTP = {
+    "rate_limit": "429",
+    "tenant_quota": "429",
+    "partition_overload": "503",
+    "load_shedding": "503",
+}
 WINDOWS_PATH_CANDIDATES = (
     Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Cloud SDK/google-cloud-sdk/bin",
     Path(os.environ.get("ProgramFiles", "")) / "Google/Cloud SDK/google-cloud-sdk/bin",
@@ -46,6 +75,9 @@ class BenchmarkResult:
     p95_latency_ms: float
     matches_before: int
     matches_after: int
+    run_duration_seconds: int
+    rejections_by_reason: dict[str, int]
+    rejections_by_tenant: dict[str, dict[str, int]]
 
 
 class StepTracker:
@@ -145,6 +177,46 @@ def augment_path() -> None:
         os.environ["PATH"] = os.pathsep.join([*additions, os.environ.get("PATH", "")])
 
 
+def load_project_env() -> None:
+    if not ENV_FILE.is_file():
+        return
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(ENV_FILE, override=False)
+    except ImportError:
+        for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key, value = key.strip(), value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+def resolve_postgres_password(explicit: str | None = None) -> str | None:
+    if explicit:
+        return explicit
+    for key in ("PG_PASS", "PMS_POSTGRES_PASSWORD"):
+        if value := os.environ.get(key):
+            return value
+    return None
+
+
+def validate_postgres_password(password: str | None) -> str:
+    if not password:
+        raise RuntimeError(
+            "Set PG_PASS in .env (or PMS_POSTGRES_PASSWORD / --postgres-password) before deploying"
+        )
+    if password.strip().lower() in PLACEHOLDER_PASSWORDS:
+        raise RuntimeError(
+            f"Postgres password looks like a placeholder ({password!r}). "
+            "Set a real PG_PASS in .env."
+        )
+    return password
+
+
 def resolve_executable(name: str) -> str:
     candidates = [name]
     if sys.platform == "win32" and not name.lower().endswith(".exe"):
@@ -232,11 +304,14 @@ def wait_until(
     raise RuntimeError(timeout_error)
 
 
-def sum_metric(url: str, metric_name: str) -> float:
+def fetch_metrics_text(url: str) -> str:
     with urllib.request.urlopen(url, timeout=15) as response:
-        lines = response.read().decode("utf-8").splitlines()
+        return response.read().decode("utf-8")
+
+
+def sum_metric(url: str, metric_name: str) -> float:
     total = 0.0
-    for line in lines:
+    for line in fetch_metrics_text(url).splitlines():
         if line.startswith("#") or not line.strip():
             continue
         match = METRIC_LINE.match(line.strip())
@@ -245,11 +320,64 @@ def sum_metric(url: str, metric_name: str) -> float:
     return total
 
 
+def parse_metric_labels(raw: str) -> dict[str, str]:
+    return {match.group(1): match.group(2) for match in METRIC_LABEL_KV.finditer(raw)}
+
+
+def parse_rejection_metrics(url: str) -> tuple[dict[str, int], dict[str, dict[str, int]]]:
+    by_reason: dict[str, int] = {}
+    by_tenant: dict[str, dict[str, int]] = {}
+    for line in fetch_metrics_text(url).splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        match = LABELED_METRIC_LINE.match(line.strip())
+        if not match or match.group("name") != "tickets_rejected_total":
+            continue
+        labels = parse_metric_labels(match.group("labels"))
+        reason = labels.get("reason", "unknown")
+        tenant_id = labels.get("tenant_id", "unknown")
+        count = int(float(match.group("value")))
+        by_reason[reason] = by_reason.get(reason, 0) + count
+        by_tenant.setdefault(tenant_id, {})[reason] = (
+            by_tenant.setdefault(tenant_id, {}).get(reason, 0) + count
+        )
+    return by_reason, by_tenant
+
+
+def format_rejection_share(count: int, total: int) -> str:
+    if total <= 0:
+        return "—"
+    return f"{100 * count / total:.1f}%"
+
+
+def format_rejection_tenant_summary(by_tenant: dict[str, dict[str, int]], reason: str) -> str:
+    counts = [tenant.get(reason, 0) for tenant in by_tenant.values() if tenant.get(reason, 0) > 0]
+    if not counts:
+        return f"No `{reason}` rejections recorded."
+    tenant_count = len(counts)
+    low, high = min(counts), max(counts)
+    if tenant_count == 1:
+        return f"All `{reason}` rejections came from one tenant ({low:,})."
+    if high - low <= max(5, high * 0.05):
+        return (
+            f"Rejections are spread evenly across {tenant_count} tenants "
+            f"({low:,}–{high:,} each for `{reason}`). "
+            "That pattern means per-tenant rate limiting, not one hot partition or tenant."
+        )
+    return (
+        f"`{reason}` rejections across {tenant_count} tenants ranged from {low:,} to {high:,} "
+        f"(uneven spread — check for hot tenants or partitions)."
+    )
+
+
 def parse_k6_summary(path: Path) -> dict[str, float]:
     metrics = json.loads(path.read_text(encoding="utf-8")).get("metrics", {})
 
     def value(metric: str, key: str) -> float:
-        return float(metrics.get(metric, {}).get("values", {}).get(key, 0.0))
+        data = metrics.get(metric, {})
+        if key in data:
+            return float(data[key])
+        return float(data.get("values", {}).get(key, 0.0))
 
     return {
         "tickets_created": value("tickets_created", "count"),
@@ -262,19 +390,20 @@ def write_results_file(
     rows: list[BenchmarkResult], path: Path, *, zone: str, project_id: str, access_mode: str,
 ) -> None:
     timestamp = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    duration = rows[0].run_duration_seconds if rows else K6_DURATION_SECONDS
     lines = [
         "# GKE scale-out benchmark results", "", f"**Generated:** {timestamp}  ",
         f"**Cluster:** GKE zonal, `{zone}`, project `{project_id}`  ",
         "**Machine type:** e2-standard-4  ",
         "**Load script:** `loadtests/scale_out.js` (multi-tenant)  ",
-        f"**Run duration:** {K6_DURATION_SECONDS}s per node count  ", f"**Access:** {access_mode}", "",
+        f"**Run duration:** {duration}s per node count  ", f"**Access:** {access_mode}", "",
         "| Nodes | API / Worker / Dispatcher | Tickets created | Tickets rejected | matches_created/s | Tickets:matches ratio | p95 ticket-create latency |",
         "|-------|---------------------------|-----------------|------------------|-------------------|----------------------|---------------------------|",
     ]
     lines += [
         f"| {r.nodes} | {r.replicas} | {r.tickets_created} ({r.tickets_per_sec}/s) | "
         f"{r.tickets_rejected} ({r.rejected_per_sec}/s) | "
-        f"{r.matches_per_sec} ({r.matches_delta} matches / {K6_DURATION_SECONDS}s) | "
+        f"{r.matches_per_sec} ({r.matches_delta} matches / {r.run_duration_seconds}s) | "
         f"{r.pair_ratio_pct}% | {r.p95_latency_ms}ms |" for r in rows
     ]
     lines += ["", "## Raw worker metrics", ""]
@@ -283,9 +412,44 @@ def write_results_file(
         f"after={r.matches_after}, delta={r.matches_delta}" for r in rows
     ]
     lines += [
-        "", "## Notes", "",
+        "", "## Admission control rejections", "",
+        "From API `/metrics` after each run (`tickets_rejected_total`).", "",
+    ]
+    for row in rows:
+        total = sum(row.rejections_by_reason.values())
+        lines.append(f"### {row.nodes} node(s)")
+        lines += [
+            "",
+            "| Reason | HTTP | Count | Share |",
+            "|--------|------|------:|------:|",
+        ]
+        for reason in REJECTION_REASON_ORDER:
+            count = row.rejections_by_reason.get(reason, 0)
+            http = REJECTION_REASON_HTTP.get(reason, "—")
+            lines.append(
+                f"| `{reason}` | {http} | {count:,} | {format_rejection_share(count, total)} |"
+            )
+        extra_reasons = sorted(
+            reason for reason in row.rejections_by_reason if reason not in REJECTION_REASON_ORDER
+        )
+        for reason in extra_reasons:
+            count = row.rejections_by_reason[reason]
+            lines.append(
+                f"| `{reason}` | — | {count:,} | {format_rejection_share(count, total)} |"
+            )
+        lines.append("")
+        if total:
+            dominant = max(row.rejections_by_reason, key=row.rejections_by_reason.get)
+            lines.append(format_rejection_tenant_summary(row.rejections_by_tenant, dominant))
+        else:
+            lines.append("No admission-control rejections recorded in API metrics.")
+        lines.append("")
+    lines += [
+        "## Notes", "",
         "- Worker deployment restarted before each run so partition leases redistribute.",
         "- Node pool scaled to 0 automatically after the script finished (unless `--skip-teardown`).",
+        "- High `rate_limit` (429) counts are expected: `scale_out.js` ramps to 100 VUs while each "
+        "tenant is capped at 300 ticket creates/minute (`DEFAULT_TICKET_RATE_LIMIT_PER_MINUTE`).",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"Results written to {path}", flush=True)
@@ -294,12 +458,23 @@ def write_results_file(
 class BenchmarkRunner:
     DATA_STORES = ("app=postgres", "app=redis")
     APP_STACK = ("app=api", "app=worker")
+    STATEFUL_STORES = (
+        ("postgres", "postgres-data-postgres-0", "infra/k8s/postgres.yaml"),
+        ("redis", "redis-data-redis-0", "infra/k8s/redis.yaml"),
+    )
 
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.node_counts = [1, 3, 5] if args.all else [args.node_count]
         self.results: list[BenchmarkResult] = []
-        self.steps = StepTracker(7 + len(self.node_counts) * 3)
+        self.postgres_password = validate_postgres_password(
+            resolve_postgres_password(args.postgres_password)
+        )
+        self.k6_duration = K6_SMOKE_DURATION_SECONDS if args.smoke else K6_DURATION_SECONDS
+        if args.smoke and args.ingress_timeout == 480:
+            args.ingress_timeout = 300
+        step_total = 2 if args.preflight else 8 + len(self.node_counts) * 3
+        self.steps = StepTracker(step_total)
 
     @property
     def ns(self) -> str:
@@ -331,6 +506,13 @@ class BenchmarkRunner:
                 "Add them to PATH (Google Cloud SDK bin, k6, Docker Desktop)."
             )
         print("Tools OK: gcloud, kubectl, k6, docker", flush=True)
+
+    def preflight(self) -> None:
+        self.steps.begin("Preflight checks")
+        print(f"  Postgres password: loaded ({len(self.postgres_password)} chars)", flush=True)
+        run(self.cluster_cmd("get-credentials"))
+        self.wait_for_cluster(timeout=120)
+        print("  Cluster credentials OK.", flush=True)
 
     def wait_for_cluster(self, timeout: int = 300) -> None:
         a = self.args
@@ -457,29 +639,245 @@ class BenchmarkRunner:
             time.sleep(5)
         raise RuntimeError("Timed out waiting for ingress deletion to finish")
 
-    def apply_ingress(self, timeout: int = 600) -> str:
-        self.delete_ingress()
-        run(kubectl("apply", "-f", "infra/k8s/ingress.yaml"))
+    def verify_service_endpoints(self, service: str) -> None:
+        addresses = run(kubectl(
+            "get", "endpoints", service, "-o",
+            "jsonpath={.subsets[*].addresses[*].ip}", namespace=self.ns,
+        ), capture=True, quiet=True, check=False).stdout.strip()
+        if addresses:
+            return
+        self.pod_diagnostics(f"app={service}" if service == "api" else f"app={service}")
+        raise RuntimeError(
+            f"Service '{service}' has no ready endpoints. Fix the workload before creating ingress."
+        )
+
+    def current_node_names(self) -> set[str]:
+        output = run(
+            kubectl("get", "nodes", "-o", "jsonpath={.items[*].metadata.name}"),
+            capture=True, quiet=True, check=False,
+        ).stdout.strip()
+        return {name for name in output.split() if name}
+
+    def pvc_selected_node(self, pvc_name: str) -> str | None:
+        output = run(kubectl(
+            "get", "pvc", pvc_name,
+            "-o", "jsonpath={.metadata.annotations.volume\\.kubernetes\\.io/selected-node}",
+            namespace=self.ns,
+        ), capture=True, quiet=True, check=False).stdout.strip()
+        return output or None
+
+    def pod_scheduling_issue(self, pod_name: str) -> str | None:
+        phase = run(kubectl(
+            "get", "pod", pod_name, "-o", "jsonpath={.status.phase}", namespace=self.ns,
+        ), capture=True, quiet=True, check=False).stdout.strip()
+        if phase != "Pending":
+            return None
+        events = run(kubectl(
+            "get", "events", "--field-selector", f"involvedObject.name={pod_name}",
+            "--sort-by=.lastTimestamp", namespace=self.ns,
+        ), capture=True, quiet=True, check=False).stdout
+        for line in reversed(events.splitlines()):
+            lowered = line.lower()
+            if "persistentvolume's node affinity" in lowered:
+                return line.strip()
+            if "didn't match persistentvolume's node affinity" in lowered:
+                return line.strip()
+        return None
+
+    def stateful_store_needs_reset(self, app: str, pvc_name: str) -> bool:
+        nodes = self.current_node_names()
+        if not nodes:
+            return False
+        selected = self.pvc_selected_node(pvc_name)
+        if selected and selected not in nodes:
+            return True
+        return self.pod_scheduling_issue(f"{app}-0") is not None
+
+    def wait_stateful_pod_deleted(self, app: str, timeout: int = 120) -> None:
+        wait_until(
+            f"Waiting for {app}-0 deletion", timeout, 5,
+            lambda: (
+                run(kubectl(
+                    "get", "pod", f"{app}-0", "--ignore-not-found", "--no-headers",
+                    namespace=self.ns,
+                ), capture=True, quiet=True, check=False).stdout.strip() == "",
+                "",
+                None,
+            ),
+            "deleted",
+            f"Timed out waiting for {app}-0 to be deleted",
+        )
+
+    def reset_stateful_store(self, app: str, pvc_name: str, manifest: str) -> None:
+        print(f"  Resetting {app}: PVC pinned to a deleted node", flush=True)
+        run(kubectl("scale", f"statefulset/{app}", "--replicas=0", namespace=self.ns), quiet=True)
+        self.wait_stateful_pod_deleted(app)
+        run(kubectl("delete", "pvc", pvc_name, "--ignore-not-found", "--wait=true", namespace=self.ns))
+        run(kubectl("apply", "-f", manifest))
+        run(kubectl("scale", f"statefulset/{app}", "--replicas=1", namespace=self.ns), quiet=True)
+
+    def restart_app_deployments(self) -> None:
+        for deployment in ("api", "worker", "callback-dispatcher"):
+            run(kubectl("rollout", "restart", f"deployment/{deployment}", namespace=self.ns), quiet=True)
+
+    def ensure_migration(self) -> None:
+        subprocess.run(prepare_cmd(kubectl(
+            "delete", "job", "pms-migrate", "--ignore-not-found", namespace=self.ns,
+        )), cwd=ROOT, check=False)
+        run(kubectl("apply", "-f", "infra/k8s/migrate-job.yaml"))
+        self.wait_resource("complete", ("job/pms-migrate",), 180, "Running database migration", 120)
+
+    def ensure_stateful_stores(self) -> bool:
+        reset_postgres = False
+        for app, pvc_name, manifest in self.STATEFUL_STORES:
+            if self.stateful_store_needs_reset(app, pvc_name):
+                self.reset_stateful_store(app, pvc_name, manifest)
+                if app == "postgres":
+                    reset_postgres = True
+        if reset_postgres:
+            self.wait_for_pods("app=postgres")
+            self.verify_postgres_auth()
+            self.ensure_migration()
+            self.restart_app_deployments()
+            for deployment in ("api", "worker", "callback-dispatcher"):
+                with TaskProgress(f"Rollout {deployment} after postgres reset", 180):
+                    run(kubectl(
+                        "rollout", "status", f"deployment/{deployment}", "--timeout=180s",
+                        namespace=self.ns,
+                    ), quiet=True)
+        return reset_postgres
+
+    def verify_postgres_auth(self) -> None:
+        password = self.postgres_password
+        result = run(kubectl(
+            "exec", "statefulset/postgres", "--",
+            "env", f"PGPASSWORD={password}", "psql", "-U", "pms", "-d", "pms", "-tAc", "SELECT 1",
+            namespace=self.ns,
+        ), check=False, capture=True, quiet=True)
+        combined = f"{result.stdout}\n{result.stderr}".strip()
+        if result.returncode == 0 and "1" in combined:
+            print("  Postgres auth OK.", flush=True)
+            return
+        if "password authentication failed" in combined.lower():
+            raise RuntimeError(
+                "Postgres password mismatch: PG_PASS does not match the password stored in the "
+                "postgres PVC. Reset Postgres, then re-run:\n"
+                "  kubectl -n pms scale statefulset/postgres --replicas=0\n"
+                "  kubectl -n pms wait --for=delete pod/postgres-0 --timeout=120s\n"
+                "  kubectl -n pms delete pvc postgres-data-postgres-0"
+            )
+        raise RuntimeError(f"Postgres auth check failed: {combined[:240]}")
+
+    def get_ingress_ip(self) -> str | None:
+        ip = run(kubectl(
+            "get", "ingress", "pms-api", "-o",
+            "jsonpath={.status.loadBalancer.ingress[0].ip}", namespace=self.ns,
+        ), capture=True, quiet=True, check=False).stdout.strip()
+        return ip or None
+
+    def ingress_failure_reason(self) -> str | None:
+        events = run(kubectl(
+            "get", "events", "--field-selector", "involvedObject.name=pms-api",
+            "--sort-by=.lastTimestamp", namespace=self.ns,
+        ), capture=True, quiet=True, check=False).stdout
+        describe = run(
+            kubectl("describe", "ingress", "pms-api", namespace=self.ns),
+            capture=True, quiet=True, check=False,
+        ).stdout
+        combined = f"{events}\n{describe}".lower()
+        for pattern in INGRESS_FATAL_PATTERNS:
+            if pattern in combined:
+                for line in f"{events}\n{describe}".splitlines():
+                    if pattern in line.lower():
+                        return line.strip()[:240]
+                return f"Ingress/LB error matched: {pattern}"
+        if "unhealthy" in combined:
+            return "GCE ingress backend is UNHEALTHY (check API readiness and /health)"
+        return None
+
+    def ingress_diagnostics(self) -> None:
+        print("\n  --- Ingress diagnostics ---", flush=True)
+        run(kubectl("get", "ingress", "pms-api", "-o", "wide", namespace=self.ns), check=False)
+        run(kubectl("describe", "ingress", "pms-api", namespace=self.ns), check=False)
+        run(kubectl("get", "endpoints", "api", namespace=self.ns), check=False)
+        run(kubectl(
+            "get", "events", "--field-selector", "involvedObject.name=pms-api",
+            "--sort-by=.lastTimestamp", namespace=self.ns,
+        ), check=False)
+
+    def wait_for_ingress_ip(self, timeout: int) -> str:
+        started_at = time.time()
 
         def check() -> tuple[bool, str, str | None]:
-            ip = run(kubectl(
-                "get", "ingress", "pms-api", "-o",
-                "jsonpath={.status.loadBalancer.ingress[0].ip}", namespace=self.ns,
-            ), capture=True, quiet=True).stdout.strip()
-            return bool(ip), "provisioning load balancer", ip or None
+            ip = self.get_ingress_ip()
+            if ip:
+                return True, f"Ingress IP {ip}", ip
+            elapsed = time.time() - started_at
+            if elapsed >= INGRESS_ERROR_CHECK_GRACE_SECONDS:
+                if reason := self.ingress_failure_reason():
+                    raise RuntimeError(f"Ingress failed after {int(elapsed)}s: {reason}")
+                if not run(kubectl(
+                    "get", "endpoints", "api", "-o",
+                    "jsonpath={.subsets[*].addresses[*].ip}", namespace=self.ns,
+                ), capture=True, quiet=True, check=False).stdout.strip():
+                    raise RuntimeError(
+                        f"Ingress has no IP after {int(elapsed)}s and service 'api' has no endpoints"
+                    )
+            detail = "provisioning load balancer"
+            if elapsed >= INGRESS_ERROR_CHECK_GRACE_SECONDS:
+                detail = f"still no IP after {int(elapsed)}s (checking events)"
+            return False, detail, None
 
-        ip = wait_until(
-            "Waiting for ingress external IP", timeout, 15, check,
-            lambda value: f"Ingress IP {value}", "Timed out waiting for ingress IP on pms-api",
-        )
+        try:
+            ip = wait_until(
+                "Waiting for ingress external IP", timeout, 10, check,
+                lambda value: f"Ingress IP {value}",
+                f"Timed out waiting for ingress IP on pms-api after {timeout}s",
+            )
+        except RuntimeError:
+            self.ingress_diagnostics()
+            raise
         assert ip
         return ip
 
-    def start_port_forward(self, resource: str, local: int, remote: int) -> subprocess.Popen:
-        return subprocess.Popen([
+    def apply_ingress(self, timeout: int | None = None) -> str:
+        timeout = timeout or self.args.ingress_timeout
+        existing_ip = self.get_ingress_ip()
+        if existing_ip and not self.args.recreate_ingress:
+            print(f"  Reusing existing ingress IP {existing_ip}", flush=True)
+            return existing_ip
+
+        if self.args.recreate_ingress:
+            self.delete_ingress()
+        run(kubectl("apply", "-f", "infra/k8s/ingress.yaml"))
+        self.verify_service_endpoints("api")
+        return self.wait_for_ingress_ip(timeout)
+
+    def start_port_forward(
+        self, resource: str, local: int, remote: int, *, health_path: str = "/",
+    ) -> subprocess.Popen:
+        process = subprocess.Popen([
             resolve_executable("kubectl"), "-n", self.ns, "port-forward", resource,
             f"{local}:{remote}",
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.time() + 15
+        url = f"http://127.0.0.1:{local}{health_path}"
+        while time.time() < deadline:
+            if process.poll() is not None:
+                raise RuntimeError(
+                    f"kubectl port-forward {resource} {local}:{remote} exited early "
+                    f"(code {process.returncode})"
+                )
+            try:
+                with urllib.request.urlopen(url, timeout=1) as response:
+                    if response.status < 500:
+                        return process
+            except Exception:
+                time.sleep(0.5)
+        self.stop_process(process)
+        raise RuntimeError(
+            f"kubectl port-forward {resource} {local}:{remote} did not become reachable within 15s"
+        )
 
     @staticmethod
     def stop_process(process: subprocess.Popen | None) -> None:
@@ -506,10 +904,9 @@ class BenchmarkRunner:
         if a.skip_deploy:
             self.steps.begin("Skip deploy (workloads already running)")
             print("  Using existing deployment.", flush=True)
+            self.ensure_stateful_stores()
             return
-        password = a.postgres_password or os.environ.get("PMS_POSTGRES_PASSWORD")
-        if not password:
-            raise RuntimeError("Set PMS_POSTGRES_PASSWORD before deploying")
+        password = self.postgres_password
 
         self.steps.begin("Apply Kubernetes manifests")
         run(kubectl("apply", "-f", "infra/k8s/namespace.yaml"))
@@ -525,18 +922,17 @@ class BenchmarkRunner:
         self.apply_manifests(
             "infra/k8s/configmap.yaml", "infra/k8s/postgres.yaml", "infra/k8s/redis.yaml"
         )
+        postgres_reset = self.ensure_stateful_stores()
         self.wait_resource("ready", ("pod", "-l", "app=postgres"), 180, "Waiting for Postgres pod", 180)
+        if not postgres_reset:
+            self.verify_postgres_auth()
 
         migrated = subprocess.run(prepare_cmd(kubectl(
             "get", "job", "pms-migrate", "-o", "jsonpath={.status.succeeded}",
             namespace=self.ns,
         )), cwd=ROOT, text=True, capture_output=True).stdout.strip()
         if migrated != "1":
-            subprocess.run(prepare_cmd(kubectl(
-                "delete", "job", "pms-migrate", "--ignore-not-found", namespace=self.ns,
-            )), cwd=ROOT, check=False)
-            run(kubectl("apply", "-f", "infra/k8s/migrate-job.yaml"))
-            self.wait_resource("complete", ("job/pms-migrate",), 180, "Running database migration", 120)
+            self.ensure_migration()
 
         self.apply_manifests(
             "infra/k8s/mock-callback.yaml", "infra/k8s/api.yaml",
@@ -608,13 +1004,22 @@ class BenchmarkRunner:
             nonlocal detail
             healthy, detail = self.health_status(url)
             lowered = detail.lower()
+            if "password authentication failed" in lowered:
+                raise RuntimeError(
+                    "API cannot connect to Postgres (password authentication failed). "
+                    "PG_PASS must match the postgres PVC password — delete the PVC and re-run."
+                )
             if "empty reply" in lowered or "connection reset" in lowered:
                 detail = "load balancer not ready yet"
-            elif "pool not initialized" in lowered and time.time() - started_at >= 30:
-                raise RuntimeError(
-                    "API PostgreSQL initialization did not run within 30 seconds. "
-                    "The API process must call init_db() from its startup/lifespan hook."
-                )
+            elif "pool not initialized" in lowered:
+                if time.time() - started_at >= 300:
+                    raise RuntimeError(
+                        "API PostgreSQL pool not initialized after 300 seconds. "
+                        f"Last health response: {detail}"
+                    )
+                detail = "API starting up (DB pool not ready yet)"
+            elif "postgres=error" in lowered or "postgres=failed" in lowered:
+                raise RuntimeError(f"API Postgres check failed: {detail}")
             return healthy, detail[:60], None
 
         try:
@@ -627,7 +1032,6 @@ class BenchmarkRunner:
 
     def wait_health_in_cluster(self, timeout: int = 180) -> None:
         process = self.start_port_forward("svc/api", 18080, 8080)
-        time.sleep(3)
         try:
             self.wait_health(
                 "http://127.0.0.1:18080/health", "Waiting for API /health (in-cluster)", timeout
@@ -641,16 +1045,18 @@ class BenchmarkRunner:
         if self.args.use_port_forward:
             print("  WARNING: port-forward cannot sustain 100 VUs.", flush=True)
             api_process = self.start_port_forward("svc/api", 8080, 8080)
-            time.sleep(3)
             base_url = "http://localhost:8080"
         else:
-            self.wait_health_in_cluster()
+            if not self.get_ingress_ip():
+                self.wait_health_in_cluster()
             base_url = f"http://{self.apply_ingress()}"
             print(f"  API URL: {base_url}", flush=True)
 
-        with TaskProgress("Starting worker metrics port-forward", 5):
-            metrics_process = self.start_port_forward("svc/worker-metrics", 9090, 9090)
-            time.sleep(3)
+        metrics_process = self.start_port_forward(
+            "svc/worker-metrics", 9090, 9090, health_path="/metrics",
+        )
+        rejections_by_reason: dict[str, int] = {}
+        rejections_by_tenant: dict[str, dict[str, int]] = {}
         try:
             self.wait_health(f"{base_url}/health", "Waiting for API /health via ingress", 600)
             try:
@@ -664,15 +1070,31 @@ class BenchmarkRunner:
             summary = Path(os.environ.get("TEMP", "/tmp")) / f"pms-k6-summary-{nodes}.json"
             if summary.exists():
                 summary.unlink()
-            run_with_progress([
-                "k6", "run", "-e", f"BASE_URL={base_url}",
+            k6_cmd = ["k6", "run"]
+            if self.args.smoke:
+                k6_cmd.extend(["--stage", "30s:10,60s:20,30s:0"])
+            k6_cmd.extend([
+                "-e", f"BASE_URL={base_url}",
                 f"--summary-export={summary}", "loadtests/scale_out.js",
-            ], "k6 load test", expected_seconds=K6_DURATION_SECONDS + 30)
+            ])
+            run_with_progress(
+                k6_cmd, "k6 load test", expected_seconds=self.k6_duration + 30,
+            )
             after = int(sum_metric(
                 "http://localhost:9090/metrics", "pms_worker_matches_created_total"
             ))
             k6 = parse_k6_summary(summary)
             print(f"  Worker matches after: {after} (delta {after - before})", flush=True)
+            rejections_by_reason, rejections_by_tenant = parse_rejection_metrics(
+                f"{base_url}/metrics"
+            )
+            if rejections_by_reason:
+                total_rejected = sum(rejections_by_reason.values())
+                print(
+                    f"  API rejections: {total_rejected} total "
+                    f"({', '.join(f'{k}={v}' for k, v in sorted(rejections_by_reason.items()))})",
+                    flush=True,
+                )
         finally:
             self.stop_process(metrics_process)
             self.stop_process(api_process)
@@ -682,10 +1104,11 @@ class BenchmarkRunner:
         return BenchmarkResult(
             nodes, f"{nodes} / {nodes} / {self.dispatcher_replicas(nodes)}",
             int(k6["tickets_created"]), int(k6["tickets_rejected"]),
-            round(k6["tickets_created"] / K6_DURATION_SECONDS, 2),
-            round(k6["tickets_rejected"] / K6_DURATION_SECONDS, 2),
-            delta, round(delta / K6_DURATION_SECONDS, 2), ratio,
+            round(k6["tickets_created"] / self.k6_duration, 2),
+            round(k6["tickets_rejected"] / self.k6_duration, 2),
+            delta, round(delta / self.k6_duration, 2), ratio,
             round(k6["p95_ms"], 2), before, after,
+            self.k6_duration, rejections_by_reason, rejections_by_tenant,
         )
 
     def write_results(self) -> None:
@@ -724,9 +1147,10 @@ class BenchmarkRunner:
         try:
             self.steps.begin("Verify required tools")
             self.verify_tools()
-            self.steps.begin(f"Connect kubectl to {self.args.cluster_name}")
-            run(self.cluster_cmd("get-credentials"))
-            self.wait_for_cluster()
+            self.preflight()
+            if self.args.preflight:
+                print("\nPreflight passed.", flush=True)
+                return 0
             self.build_image()
             for nodes in self.node_counts:
                 self.steps.begin(f"Scale node pool to {nodes}")
@@ -746,7 +1170,8 @@ class BenchmarkRunner:
             print(f"\nFAILED: {exc}", file=sys.stderr, flush=True)
             raise
         finally:
-            self.teardown()
+            if not self.args.preflight:
+                self.teardown()
 
 
 def parse_args() -> argparse.Namespace:
@@ -756,8 +1181,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--skip-deploy", action="store_true")
     parser.add_argument("--skip-teardown", action="store_true")
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Quick 2-minute k6 run and 5-minute ingress timeout (for validation)",
+    )
+    parser.add_argument("--preflight", action="store_true", help="Run preflight checks only, then exit")
+    parser.add_argument("--recreate-ingress", action="store_true", help="Delete and recreate GCE ingress")
+    parser.add_argument(
+        "--ingress-timeout",
+        type=int,
+        default=480,
+        help="Max seconds to wait for ingress IP (default: 480)",
+    )
     parser.add_argument("--use-port-forward", action="store_true")
-    parser.add_argument("--postgres-password", default=os.environ.get("PMS_POSTGRES_PASSWORD"))
+    parser.add_argument(
+        "--postgres-password",
+        default=resolve_postgres_password(),
+        help="Postgres password (default: PG_PASS from .env, then PMS_POSTGRES_PASSWORD)",
+    )
     parser.add_argument("--project-id", default="se-proto")
     parser.add_argument("--zone", default="europe-west1-b")
     parser.add_argument("--cluster-name", default="pms-cluster")
@@ -772,6 +1214,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     configure_stdio()
     augment_path()
+    load_project_env()
     args = parse_args()
     os.environ["USE_GKE_GCLOUD_AUTH_PLUGIN"] = "True"
     return BenchmarkRunner(args).execute()
