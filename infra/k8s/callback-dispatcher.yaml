@@ -27,7 +27,7 @@ spec:
     spec:
       containers:
         - name: callback-dispatcher
-          image: pms:local
+          image: europe-west1-docker.pkg.dev/se-proto/pms/pms:local
           command: ["python", "-m", "app.callback_dispatcher.main"]
           ports:
             - containerPort: 9091

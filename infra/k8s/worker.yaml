@@ -27,7 +27,7 @@ spec:
     spec:
       containers:
         - name: worker
-          image: pms:local
+          image: europe-west1-docker.pkg.dev/se-proto/pms/pms:local
           command: ["python", "-m", "app.worker.main"]
           ports:
             - containerPort: 9090
