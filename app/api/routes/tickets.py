@@ -13,7 +13,6 @@ from app.core.idempotency import (
     store_idempotency_key,
 )
 from app.core.metrics import (
-    active_tickets,
     tickets_cancelled_total,
     tickets_created_total,
     tickets_rejected_total,
@@ -117,7 +116,6 @@ async def create_ticket(
                 tickets_created_total.labels(
                     tenant_id=tenant_id, region=body.region, queue_name=body.queue_name
                 ).inc()
-                active_tickets.labels(tenant_id=tenant_id, partition_id=str(partition_id)).inc()
 
                 if idempotency_key is not None:
                     await store_idempotency_key(
@@ -173,14 +171,11 @@ async def cancel_ticket(ticket_id: str, tenant: dict = Depends(require_tenant)):
                WHERE ticket_id = $1::uuid
                  AND tenant_id = $2
                  AND status IN ('waiting', 'reserved')
-               RETURNING ticket_id, status, cancelled_at, partition_id""",
+               RETURNING ticket_id, status, cancelled_at""",
             ticket_id,
             tenant["tenant_id"],
         )
     if row is None:
         raise HTTPException(status_code=404, detail="Ticket not found")
     tickets_cancelled_total.labels(tenant_id=tenant["tenant_id"]).inc()
-    active_tickets.labels(
-        tenant_id=tenant["tenant_id"], partition_id=str(row["partition_id"])
-    ).dec()
     return TicketCancelResponse(**dict(row))
