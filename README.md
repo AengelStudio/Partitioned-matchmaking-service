@@ -6,7 +6,7 @@ A prototype B2B matchmaking backend for multiplayer game studios. Studios submit
 
 The project focuses on scalability. It separates stateless API components from stateful queue/match storage, supports horizontal scaling through replicated API and worker pods, and includes overload protection so scaling one component does not overload another.
 
-Licensed for non-commercial use only — see [`LICENSE`](LICENSE).
+Licensed for non-commercial use only — see `[LICENSE](LICENSE)`.
 
 ## Tech Stack
 
@@ -19,11 +19,42 @@ Licensed for non-commercial use only — see [`LICENSE`](LICENSE).
 - Terraform for infrastructure provisioning
 - K6 for repeatable load testing
 
-## Architecture Summary
+## Architecture
 
-Game studio backends create matchmaking tickets through stateless API pods. Tickets are stored in PostgreSQL and assigned to logical partitions based on tenant, region, and queue type. Matchmaking worker pods claim partitions, process compatible tickets, create matches, and schedule callback events.
+The diagram below shows how PMS is deployed on GKE: external tenants and tooling on the left, stateless compute pods in the upper half of the cluster, and durable storage in the lower half.
 
-Match results are delivered primarily through tenant callbacks instead of constant polling, reducing load on the service. Polling endpoints remain available as a fallback and for debugging.
+PMS architecture diagram
+
+Source file: `[PMS diagram.svg](PMS%20diagram.svg)` (editable in [draw.io](https://app.diagrams.net/)).
+
+### Request path (ticket creation)
+
+1. A **game studio backend** (tenant client) sends matchmaking requests to **GCE Ingress / Cloud Load Balancer**, which routes traffic to an available **API pod**.
+2. The API pod runs **admission control** against **Redis** — short-lived, per-tenant rate-limit counters that protect the system from overload without hitting PostgreSQL on every check.
+3. On acceptance, the API pod **registers the ticket** in **PostgreSQL**, the durable source of truth. Tickets are keyed by tenant, region, and queue type so they land in the correct logical partition. Idempotency keys make retries safe.
+
+### Matchmaking path
+
+1. **Worker pods** **lease partitions** in PostgreSQL so each partition is owned by at most one worker at a time. Leases expire automatically if a worker dies, allowing recovery without manual intervention.
+2. Workers **poll their leased partitions**, **reserve** compatible tickets, and **create matches**. All state changes (reservations, matches, partition leases) are written back to PostgreSQL.
+
+### Delivery path (callbacks)
+
+1. When a match is created, PostgreSQL records it in a **callback outbox**. **Callback dispatcher pods** read pending callbacks, **verify matched tickets**, and **POST results to the tenant's callback URL**.
+2. Failed deliveries are retried with **backoff and jitter**. Polling endpoints on the API remain available as a fallback and for debugging.
+
+### Cluster layout
+
+The GKE cluster separates concerns into two layers:
+
+
+| Layer                 | Components                                | Role                                                                                                                                          |
+| --------------------- | ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Stateless compute** | API, worker, and callback-dispatcher pods | Horizontally scalable; no local state between requests                                                                                        |
+| **Stateful services** | PostgreSQL StatefulSet, Redis             | PostgreSQL holds tickets, matches, leases, reservations, idempotency state, and the callback outbox; Redis holds ephemeral admission counters |
+
+
+**Terraform** provisions the cluster and supporting infrastructure (dashed *Blueprint* arrow). **K6** drives repeatable load tests against the ingress (dashed *Simulate tenant load* arrow), used for the scale-out benchmarks documented under `loadtests/`.
 
 ## Quality Goals
 
@@ -48,147 +79,131 @@ Secondary metrics include:
 - queue depth per tenant and partition
 - callback delivery success/failure rate
 
-## Getting Started
+## Local deployment (Docker)
 
-```powershell
-Copy-Item .env.example .env
-docker compose up --build
+**Prerequisites:** Docker Engine / Docker Desktop with Compose v2 (`docker compose`). All commands run from the repo root.
+
+1. **Config** - copy env file (PowerShell: `Copy-Item .env.example .env`):
+  ```bash
+   cp .env.example .env
+  ```
+2. **Start** - builds images, runs DB migration, waits until services are healthy:
+  ```bash
+   docker compose up --build -d --wait
+  ```
+3. **Health** :
+  ```bash
+   curl -s http://localhost:8080/health
+  ```
+   On Windows PowerShell you should use `curl.exe` instead of `curl` (the alias is `Invoke-WebRequest`).
+4. **Full E2E** — match + callback on the host (`pip install httpx` if needed):
+  ```bash
+   python scripts/integration_test_e2e.py
+  ```
+5. **Stop**
+  ```bash
+   docker compose down
+  ```
+   Add `-v` to wipe Postgres data.
+
+**Create a ticket manually**
+
+```bash
+curl -s -X POST http://localhost:8080/v1/tickets \
+  -H "Content-Type: application/json" \
+  -H "X-Tenant-Id: studio_a" \
+  -d '{"player_id":"player_123","region":"eu-west","queue_name":"ranked_1v1","skill":1470}'
 ```
 
-The API is available at `http://localhost:8080`.
-
-On PowerShell, use `curl.exe` (not `curl` — that alias is `Invoke-WebRequest`).
-
-**Health check**
-
-```powershell
-curl.exe http://localhost:8080/health
-```
-
-**Create a matchmaking ticket**
-
-Use single quotes around the JSON body in PowerShell:
-
-```powershell
-curl.exe -X POST http://localhost:8080/v1/tickets -H "Content-Type: application/json" -H "X-Tenant-Id: studio_a" -d '{"player_id":"player_123","region":"eu-west","queue_name":"ranked_1v1","skill":1470}'
-```
-
-Or with native PowerShell:
+PowerShell (`Invoke-RestMethod` because inline JSON is unreliable with `curl.exe` on Windows):
 
 ```powershell
 Invoke-RestMethod -Uri http://localhost:8080/v1/tickets -Method POST `
-  -Headers @{ "X-Tenant-Id" = "studio_a" } `
-  -ContentType "application/json" `
+  -Headers @{ "X-Tenant-Id" = "studio_a" } -ContentType "application/json" `
   -Body '{"player_id":"player_123","region":"eu-west","queue_name":"ranked_1v1","skill":1470}'
 ```
 
-On Linux/Mac, use `curl` instead of `curl.exe`.
-
-## Deployment on GKE
-
-This reproduces the 1-node / 3-node / 5-node scalability benchmark. All commands below assume a shell with `gcloud`, `terraform`, `docker`, and `kubectl` installed and authenticated (`gcloud auth login` and `gcloud auth application-default login`).
-
-### 1. Provision the cluster
+**Load test (optional, ~3 min)**
 
 ```bash
-cd infra/terraform
-terraform init
-terraform apply -var="node_count=1"
+docker compose --profile loadtest run --rm k6 run /scripts/scale_out.js
 ```
 
-`node_count` is the only thing you change between benchmark runs (`1`, `3`, or `5`); `machine_type` must stay the same across those three runs so the comparison is fair. See `infra/terraform/variables.tf` for all tunables.
+Tenants are seeded automatically by the migrate step (`app/db/init.py`). API: `http://localhost:8080`.
 
-Point `kubectl` at the new cluster (Terraform prints this exact command as an output):
+---
+
+## GKE deployment (manual)
+
+**Prerequisites:** `gcloud`, `kubectl`, `terraform`, `docker`. Authenticate: `gcloud auth login` and `gcloud auth application-default login`. Commands use **bash** (macOS, Linux, or Git Bash/WSL on Windows). Run from repo root.
+
+Set `project_id` in `infra/terraform/variables.tf` first.
+
+1. **Cluster** (`node_count`: `1`, `3`, or `5` for benchmarks):
+  ```bash
+   cd infra/terraform && terraform init && terraform apply -var="node_count=1"
+   eval "$(terraform output -raw get_credentials_command)"
+   cd ../..
+  ```
+2. **Image** - build and push (re-run after code changes):
+  ```bash
+   REGISTRY=$(terraform -chdir=infra/terraform output -raw artifact_registry_repository)
+   gcloud auth configure-docker "${REGISTRY%%/*}"
+   docker build -t "$REGISTRY/pms:local" .
+   docker push "$REGISTRY/pms:local"
+  ```
+   Set every app `image` in `infra/k8s/{api,worker,callback-dispatcher,migrate-job,mock-callback}.yaml` to `$REGISTRY/pms:local`.
+3. **Secrets + data stores** - pick one password and use the same value in both literals:
+  ```bash
+   export PGPASS='your-strong-password'
+   kubectl apply -f infra/k8s/namespace.yaml
+   kubectl create secret generic pms-secrets -n pms \
+     --from-literal=DATABASE_URL="postgresql://pms:${PGPASS}@postgres:5432/pms" \
+     --from-literal=POSTGRES_PASSWORD="${PGPASS}" \
+     --dry-run=client -o yaml | kubectl apply -f -
+   kubectl apply -f infra/k8s/configmap.yaml
+   kubectl apply -f infra/k8s/postgres.yaml -f infra/k8s/redis.yaml
+   kubectl -n pms wait --for=condition=ready pod -l app=postgres --timeout=180s
+  ```
+4. **Migrate** - schema + tenant seed (includes `studio_a` and benchmark tenants):
+  ```bash
+   kubectl apply -f infra/k8s/migrate-job.yaml
+   kubectl -n pms wait --for=condition=complete job/pms-migrate --timeout=180s
+  ```
+5. **Apps** - deploy all services, then scale replicas to match `node_count`:
+  ```bash
+   kubectl apply -f infra/k8s/mock-callback.yaml \
+     -f infra/k8s/api.yaml -f infra/k8s/worker.yaml -f infra/k8s/callback-dispatcher.yaml
+   bash scripts/scale_k8s_benchmark.sh 1
+   kubectl apply -f infra/k8s/ingress.yaml
+  ```
+   Use `3` or `5` instead of `1` when benchmarking. The script restarts workers so partition leases redistribute fairly.
+6. **Verify** - GCE ingress can take several minutes to get an IP:
+  ```bash
+   kubectl -n pms get pods
+   kubectl -n pms get ingress pms-api -w
+   curl "http://$(kubectl -n pms get ingress pms-api -o jsonpath='{.status.loadBalancer.ingress[0].ip}')/health"
+  ```
+7. **Tear down** when finished :
+  ```bash
+   cd infra/terraform && terraform destroy
+  ```
+
+### GKE benchmark (optional)
+
+Manual load test against ingress (needs [k6](https://k6.io/) on the host):
 
 ```bash
-$(terraform output -raw get_credentials_command)
+BASE_URL="http://$(kubectl -n pms get ingress pms-api -o jsonpath='{.status.loadBalancer.ingress[0].ip}')" \
+  k6 run loadtests/scale_out.js
 ```
 
-### 2. Build and push the image
+Repeat steps 1 and 5 with `node_count=3` and `5` (same `machine_type`). Results: `loadtests/results.md`.
 
-```bash
-REGISTRY=$(terraform output -raw artifact_registry_repository)
-gcloud auth configure-docker "${REGISTRY%%/*}"
-docker build -t "$REGISTRY/pms:local" .
-docker push "$REGISTRY/pms:local"
-```
-
-Then update the `image:` field in `infra/k8s/api.yaml`, `worker.yaml`, `callback-dispatcher.yaml`, and `migrate-job.yaml` from the local placeholder `pms:local` to `$REGISTRY/pms:local`.
-
-### 3. Create secrets and deploy
-
-```bash
-kubectl apply -f infra/k8s/namespace.yaml
-kubectl create secret generic pms-secrets --namespace pms \
-  --from-literal=DATABASE_URL='postgresql://pms:REPLACE_ME@postgres:5432/pms' \
-  --from-literal=POSTGRES_PASSWORD='REPLACE_ME' \
-  --dry-run=client -o yaml | kubectl apply -f -
-kubectl apply -f infra/k8s/configmap.yaml
-kubectl apply -f infra/k8s/postgres.yaml -f infra/k8s/redis.yaml
-kubectl -n pms wait --for=condition=ready pod -l app=postgres --timeout=120s
-kubectl apply -f infra/k8s/migrate-job.yaml
-kubectl -n pms wait --for=condition=complete job/pms-migrate --timeout=120s
-kubectl apply -f infra/k8s/api.yaml -f infra/k8s/worker.yaml -f infra/k8s/callback-dispatcher.yaml
-kubectl apply -f infra/k8s/ingress.yaml
-```
-
-`infra/k8s/secret.yaml` is a template only (see the comments in that file) — the `kubectl create secret ... --dry-run=client | kubectl apply -f -` line above is the real, non-committed secret creation step. Replace `REPLACE_ME` with the actual Postgres password before running it.
-
-Insert at least one tenant with a real `callback_url`/`callback_secret` directly into Postgres before running load tests, since there is no admin API for tenant management yet:
-
-```bash
-kubectl -n pms exec -it statefulset/postgres -- psql -U pms -d pms -c \
-  "INSERT INTO tenants (tenant_id, name, callback_url, callback_secret) VALUES ('studio_a', 'Studio A', 'http://mock-callback:9000/tenant-matchmaking-callback', 'REPLACE_ME');"
-```
-
-### 4. Confirm it's up
-
-```bash
-kubectl -n pms get pods
-kubectl -n pms get ingress pms-api
-curl "http://$(kubectl -n pms get ingress pms-api -o jsonpath='{.status.loadBalancer.ingress[0].ip}')/health"
-```
-
-GCE ingress can take several minutes to get a public IP after `kubectl apply` — re-run the `get ingress` command until `ADDRESS` is populated.
-
-### 5. Run the benchmark, then tear down
-
-```bash
-k6 run loadtests/scale_out.js   # see the load-testing section below
-terraform destroy               # do this after every run — the cluster bills by the hour
-```
-
-Repeat steps 1-5 with `node_count=3` and `node_count=5` (same `machine_type`) to get the three comparison points. **Always run `terraform destroy` when you're done for the day** — this project has a fixed $50 GCP grant and a forgotten cluster burns through it in days, not weeks.
-
-### Automated benchmark (boot → test → scale to 0)
-
-`scripts/run_gke_benchmark.py` (via `scripts/run_gke_benchmark.cmd`) automates the full cycle: resize the node pool, deploy manifests (unless already up), scale replicas, run `loadtests/scale_out.js` through **GCE ingress**, write results to `loadtests/results-gke-<timestamp>.md`, then scale nodes back to **0**.
-
-```powershell
-# Postgres password is read from PG_PASS in .env (or PMS_POSTGRES_PASSWORD env var)
-$env:USE_GKE_GCLOUD_AUTH_PLUGIN = "True"
-
-# Quick sanity check (~5s) before build/deploy
-scripts\run_gke_benchmark.cmd preflight
-
-# 1-node run (~5 min including deploy + 3 min k6)
-scripts\run_gke_benchmark.cmd 1
-
-# Already deployed and image pushed — benchmark only
-scripts\run_gke_benchmark.cmd 1 skip
-
-# Full 1 / 3 / 5 comparison (~20+ min, higher cost)
-scripts\run_gke_benchmark.cmd all skip
-```
-
-Requires `gcloud`, `kubectl`, `docker`, `k6`, and `py` on PATH. Uses **GCE ingress** for k6 traffic by default (port-forward cannot handle 100 VUs). Pass `--skip-teardown` to leave nodes running after the run.
-
-### Node identity in Kubernetes
-
-`WORKER_ID` and `CALLBACK_DISPATCHER_ID` are set from each pod's own name via `fieldRef` in `infra/k8s/worker.yaml` and `infra/k8s/callback-dispatcher.yaml`, so replicas never collide on identity — no manual configuration needed when scaling `kubectl scale deployment/worker --replicas=N`.
+**Automated alternative:** `scripts/run_gke_benchmark.cmd` runs deploy → k6 → results file → scale nodes to 0. Password from `PG_PASS` in `.env`. Windows: `$env:USE_GKE_GCLOUD_AUTH_PLUGIN = "True"`.
 
 ### Known limitations
 
-- No autoscaling anywhere on purpose (node pool, HPA, Autopilot) — node and pod counts are fixed and manually controlled for reproducible benchmark comparisons.
-- The tenant table has no admin API yet; tenants are inserted directly via `psql` (see step 3).
-- `infra/k8s/secret.yaml` is a template, not a real secret — see the comment at the top of that file.
+- No autoscaling (node pool, HPA) — counts are fixed for reproducible benchmarks.
+- No tenant admin API — tenants are seeded by migrate, not managed at runtime.
+- Worker partition leases do not rebalance on mid-flight scale-up; `scale_k8s_benchmark.sh` restarts workers before benchmarks.

@@ -406,13 +406,14 @@ def parse_k6_summary(path: Path) -> dict[str, float]:
 
 def write_results_file(
     rows: list[BenchmarkResult], path: Path, *, zone: str, project_id: str, access_mode: str,
+    machine_type: str,
 ) -> None:
     timestamp = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
     duration = rows[0].run_duration_seconds if rows else K6_DURATION_SECONDS
     lines = [
         "# GKE scale-out benchmark results", "", f"**Generated:** {timestamp}  ",
         f"**Cluster:** GKE zonal, `{zone}`, project `{project_id}`  ",
-        "**Machine type:** e2-standard-4  ",
+        f"**Machine type:** {machine_type}  ",
         "**Load script:** `loadtests/scale_out.js` (multi-tenant)  ",
         f"**Run duration:** {duration}s per node count  ", f"**Access:** {access_mode}", "",
         "| Nodes | API / Worker / Dispatcher | Tickets created | Tickets rejected | matches_created/s | Tickets:matches ratio | p95 ticket-create latency |",
@@ -561,6 +562,13 @@ class BenchmarkRunner:
     def schedulable(line: str) -> bool:
         line = line.strip()
         return bool(line) and " Ready " in f" {line} " and "SchedulingDisabled" not in line
+
+    def current_node_count(self) -> int:
+        output = run(
+            kubectl("get", "nodes", "--no-headers"),
+            capture=True, quiet=True, check=False,
+        ).stdout
+        return sum(self.schedulable(line) for line in output.splitlines())
 
     def uncordon_nodes(self) -> None:
         output = run(
@@ -758,10 +766,17 @@ class BenchmarkRunner:
         output = run(kubectl(
             "get", "pods", "-l", selector,
             "--field-selector=status.phase=Running",
-            "-o", 'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+            "-o", "json",
             namespace=self.ns,
         ), capture=True, quiet=True, check=False).stdout
-        return [pod for pod in map(str.strip, output.splitlines()) if pod]
+        if not output.strip():
+            return []
+        data = json.loads(output)
+        return [
+            item["metadata"]["name"]
+            for item in data.get("items", [])
+            if not item.get("metadata", {}).get("deletionTimestamp")
+        ]
 
     def fetch_pod_metrics_text(self, pod: str, port: int, path: str = "/metrics") -> str:
         url = f"http://127.0.0.1:{port}{path}"
@@ -1077,6 +1092,24 @@ class BenchmarkRunner:
                     "rollout", "status", f"deployment/{deployment}", "--timeout=180s",
                     namespace=self.ns,
                 ), quiet=True)
+        self.wait_for_old_pods_gone(tuple(replicas.keys()))
+
+    def wait_for_old_pods_gone(self, apps: tuple[str, ...], timeout: int = 120) -> None:
+        label_selector = f"app in ({','.join(apps)})"
+
+        def check() -> tuple[bool, str, None]:
+            output = run(kubectl(
+                "get", "pods", "-l", label_selector,
+                "-o", 'jsonpath={range .items[*]}{.metadata.deletionTimestamp}{"\\n"}{end}',
+                namespace=self.ns,
+            ), capture=True, quiet=True, check=False).stdout
+            terminating = sum(1 for line in output.splitlines() if line.strip())
+            return terminating == 0, f"{terminating} pod(s) still terminating", None
+
+        wait_until(
+            "Waiting for old pods to finish terminating", timeout, 5, check,
+            "terminating pods cleared", "Timed out waiting for old pods to terminate",
+        )
 
     def build_image(self) -> None:
         a = self.args
@@ -1234,6 +1267,7 @@ class BenchmarkRunner:
                 "kubectl port-forward (smoke test only)"
                 if self.args.use_port_forward else "GCE ingress load balancer"
             ),
+            machine_type=self.args.machine_type,
         )
         print("\nBenchmark summary:", flush=True)
         for row in self.results:
@@ -1268,6 +1302,14 @@ class BenchmarkRunner:
             self.build_image()
             for nodes in self.node_counts:
                 self.steps.begin(f"Scale node pool to {nodes}")
+                current_nodes = self.current_node_count()
+                if nodes > current_nodes and current_nodes > 0:
+                    # Avoid CPUS_ALL_REGIONS quota spikes when growing the pool on
+                    # larger machine types (e.g. e2-standard-8 needs 40 vCPU at 5 nodes).
+                    with TaskProgress("Scaling node pool to 0 (quota-safe resize)", 180):
+                        run(self.resize_cmd(0), quiet=True)
+                    self.wait_for_cluster()
+                    self.wait_for_nodes(0, timeout=420)
                 with TaskProgress(f"Resizing node pool to {nodes}", 180):
                     run(self.resize_cmd(nodes), quiet=True)
                 self.wait_for_cluster()
@@ -1327,6 +1369,11 @@ def parse_args() -> argparse.Namespace:
         "--registry-image", default="europe-west1-docker.pkg.dev/se-proto/pms/pms:local"
     )
     parser.add_argument("--namespace", default="pms")
+    parser.add_argument(
+        "--machine-type",
+        default=os.environ.get("PMS_MACHINE_TYPE", "e2-standard-4"),
+        help="Node machine type (for results file; set via terraform for actual nodes)",
+    )
     return parser.parse_args()
 
 
