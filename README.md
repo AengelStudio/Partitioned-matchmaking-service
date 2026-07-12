@@ -67,9 +67,28 @@ The GKE cluster separates concerns into two layers:
 - Retry handling with backoff and jitter for failed callbacks
 - Fault recovery through expiring worker leases and ticket reservations
 
+### Overload protection
+
+Admission runs in the API layer **before** PostgreSQL is touched on the hot path. Under sustained hostile load the system rejects most requests with `429` (per-tenant rate limit) or `503` (partition queue depth / load shedding) instead of letting traffic cascade into the database or workers.
+
+1. **Per-tenant rate limits** — Redis counters enforce each studio's ticket-creation quota (`app/core/admission.py`, `app/db/redis.py`).
+2. **Partition depth checks** — when a partition's waiting-ticket count exceeds the tenant's `max_partition_depth`, new tickets for that partition are rejected with `503` before insert.
+3. **Load shedding** — a last-resort gate when the API itself is under extreme pressure (visible mainly at single-replica deployments).
+
+This keeps Redis and PostgreSQL from becoming accidental bottlenecks for each other when API or worker replicas are scaled out.
+
+### Scalability strategies in code
+
+Beyond admission control and horizontal replication, two coordination patterns keep the system stable at scale:
+
+- **Partition leasing** — workers claim exclusive ownership of logical partitions in PostgreSQL (`app/worker/leases.py`, `app/shared/partition.py`). Expiring leases let crashed workers recover without double-processing; only one worker polls a partition at a time.
+- **Callback outbox** — matches are written to an outbox table and delivered asynchronously by dispatcher pods (`app/callback_dispatcher/main.py`). Retries use exponential backoff with jitter so a slow tenant callback URL cannot block matchmaking.
+
+Other supporting mechanisms: idempotent ticket creation (`app/core/idempotency.py`), expiring ticket reservations (`app/worker/matching.py`), and per-tenant fairness via seeded quotas (`app/db/init.py`, `app/core/tenants.py`). API contracts and schema details are in [`Contracts.md`](Contracts.md).
+
 ## Main Scalability Metric
 
-The primary metric is `matches_created_per_second`, measured under 1-node, 3-node, and 5-node deployments.
+The primary metric is `matches_created_per_second`, measured under 1-node, 3-node, and 5-node deployments (and optionally on more performant machine types at the same node counts).
 
 Secondary metrics include:
 
@@ -78,6 +97,30 @@ Secondary metrics include:
 - p95 ticket creation latency
 - queue depth per tenant and partition
 - callback delivery success/failure rate
+
+### Benchmark results (GKE)
+
+Load script: `loadtests/scale_out.js` (11 tenants × 5 regions × 3 queues, 180s ramp to 100 VUs). Cluster: zonal GKE `europe-west1-b`, **`e2-standard-4`** nodes unless noted. Full write-ups: [`loadtests/results-gke-synthesis-2026-07-11.md`](loadtests/results-gke-synthesis-2026-07-11.md) (horizontal scale-out), [`loadtests/results-gke-scale-up-synthesis-2026-07-12.md`](loadtests/results-gke-scale-up-synthesis-2026-07-12.md) (vertical scale-up).
+
+**Horizontal scale-out** (`e2-standard-4`, replicas scale with node count via `scripts/scale_k8s_benchmark.sh`):
+
+| Nodes | matches/s | p95 ticket-create latency | Notes |
+| ----- | --------- | ------------------------- | ----- |
+| 1     | 6.53      | 500ms                     | Single API replica saturated; load shedding active |
+| 3     | 8.53      | 70ms                      | API latency drops; match rate still partition-limited |
+| 5     | 33.05     | 38ms                      | Worker scale-out unlocks match throughput |
+
+Ticket admission stays near ~60–70/s across node counts because per-tenant rate limits cap aggregate intake — by design, not a scaling failure. Under ~300 req/s offered load, 65–75% of requests are rejected cleanly with `429` rather than the cluster falling over.
+
+**Vertical scale-up** (same 4 vCPU / 16 GB per node; **n2-standard-4** vs **e2-standard-4**):
+
+| Config | matches/s (E2 → N2) | p95 latency (E2 → N2) |
+| ------ | ------------------- | --------------------- |
+| 1 node | 6.5 → 6.3           | 500ms → 196ms         |
+| 3 node | 8.5 → 28.8          | 70ms → 34ms           |
+| 5 node | 33.1 → 29.2         | 38ms → 34ms           |
+
+Faster per-core performance mainly helps API latency at 1 node and worker throughput at 3 nodes; both machine families plateau near ~30 matches/s at 5 nodes. Partial `e2-standard-8` runs (blocked at 5 nodes by GCP vCPU quota) are in [`loadtests/results-gke-e2-standard-8-2026-07-12.md`](loadtests/results-gke-e2-standard-8-2026-07-12.md).
 
 ## Local deployment (Docker)
 
@@ -139,9 +182,9 @@ Tenants are seeded automatically by the migrate step (`app/db/init.py`). API: `h
 
 Set `project_id` in `infra/terraform/variables.tf` first.
 
-1. **Cluster** (`node_count`: `1`, `3`, or `5` for benchmarks):
+1. **Cluster** — set `node_count` to `1`, `3`, or `5` for benchmarks. Use `machine_type=e2-standard-4` to match the documented results (Terraform default is `e2-medium`):
   ```bash
-   cd infra/terraform && terraform init && terraform apply -var="node_count=1"
+   cd infra/terraform && terraform init && terraform apply -var="node_count=1" -var="machine_type=e2-standard-4"
    eval "$(terraform output -raw get_credentials_command)"
    cd ../..
   ```
@@ -198,12 +241,22 @@ BASE_URL="http://$(kubectl -n pms get ingress pms-api -o jsonpath='{.status.load
   k6 run loadtests/scale_out.js
 ```
 
-Repeat steps 1 and 5 with `node_count=3` and `5` (same `machine_type`). Results: `loadtests/results.md`.
+Repeat steps 1 and 5 with `node_count=3` and `5` (keep the same `machine_type`). See **Benchmark results** above and the linked synthesis files under `loadtests/`.
 
-**Automated alternative:** `scripts/run_gke_benchmark.cmd` runs deploy → k6 → results file → scale nodes to 0. Password from `PG_PASS` in `.env`. Windows: `$env:USE_GKE_GCLOUD_AUTH_PLUGIN = "True"`.
+**Vertical scale-up:** recreate the cluster with a more performant machine type at the same node counts, e.g. `n2-standard-4`:
+
+```bash
+cd infra/terraform && terraform apply -var="node_count=3" -var="machine_type=n2-standard-4"
+```
+
+Re-run steps 2–6, then compare against the `e2-standard-4` baseline. Use `--reset-postgres` (via `scripts/run_gke_benchmark.py`) between runs for comparable pairing metrics.
+
+**Automated alternative:** `scripts/run_gke_benchmark.cmd` / `scripts/run_gke_benchmark.py` run deploy → k6 → results file → scale nodes to 0. Password from `PG_PASS` in `.env`. Windows: `$env:USE_GKE_GCLOUD_AUTH_PLUGIN = "True"`.
 
 ### Known limitations
 
 - No autoscaling (node pool, HPA) — counts are fixed for reproducible benchmarks.
 - No tenant admin API — tenants are seeded by migrate, not managed at runtime.
 - Worker partition leases do not rebalance on mid-flight scale-up; `scale_k8s_benchmark.sh` restarts workers before benchmarks.
+- Per-tenant rate limits cap aggregate ticket throughput — raising `matches_created_per_second` in benchmarks requires multiple concurrent tenants (as `scale_out.js` does) or temporarily higher quotas.
+- Partition fragmentation (many thin queues across tenants/regions) can depress pairing efficiency until enough worker replicas cover distinct partitions.
