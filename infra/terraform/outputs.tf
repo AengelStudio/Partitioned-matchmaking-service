@@ -13,5 +13,13 @@ output "artifact_registry_repository" {
 }
 
 output "node_count" {
-  value = var.node_count
+  value = var.enable_autoscaling ? null : var.node_count
+}
+
+output "autoscaling_enabled" {
+  value = var.enable_autoscaling
+}
+
+output "node_autoscaling_range" {
+  value = var.enable_autoscaling ? "${var.min_node_count}-${var.max_node_count}" : null
 }

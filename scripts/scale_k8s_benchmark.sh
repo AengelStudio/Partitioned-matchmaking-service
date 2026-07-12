@@ -9,6 +9,9 @@ if [[ -z "$NODE_COUNT" || ! "$NODE_COUNT" =~ ^[135]$ ]]; then
   exit 1
 fi
 
+# Manual benchmark scaling overrides HPA; restore with: kubectl apply -f infra/k8s/autoscaling.yaml
+kubectl -n "$NAMESPACE" delete hpa api worker --ignore-not-found
+
 if (( NODE_COUNT > 1 )); then
   DISPATCHER_REPLICAS=$((NODE_COUNT - 1))
 else

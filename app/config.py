@@ -38,6 +38,8 @@ class Settings(BaseSettings):
     worker_loop_budget_ms: int = 2000
     worker_max_pairs_per_loop: int = 20
     worker_freshness_bias: bool = True
+    worker_elastic_rebalance_enabled: bool = True
+    worker_heartbeat_seconds: int = 30
 
     match_size: int = 2
     skill_delta_initial: int = 100

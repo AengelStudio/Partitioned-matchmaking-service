@@ -109,6 +109,11 @@ CREATE TABLE IF NOT EXISTS partition_leases (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS worker_heartbeats (
+    worker_id TEXT PRIMARY KEY,
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id),
     idempotency_key TEXT NOT NULL,

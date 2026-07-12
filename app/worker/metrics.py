@@ -19,6 +19,7 @@ class WorkerMetrics:
     matches_failed: int = 0
     leases_claimed: int = 0
     leases_renewed: int = 0
+    partitions_released: int = 0
     lease_claim_failures: int = 0
     reservations_expired: int = 0
     pair_search_runs: int = 0
@@ -58,6 +59,9 @@ class WorkerMetrics:
 
     def record_leases_renewed(self, count: int) -> None:
         self.leases_renewed += count
+
+    def record_partitions_released(self, count: int) -> None:
+        self.partitions_released += count
 
     def record_lease_claim_failure(self) -> None:
         self.lease_claim_failures += 1
@@ -109,6 +113,7 @@ class WorkerMetrics:
             f"pms_worker_rollbacks_total{{{labels}}} {self.rollbacks}",
             f"pms_worker_leases_claimed_total{{{labels}}} {self.leases_claimed}",
             f"pms_worker_leases_renewed_total{{{labels}}} {self.leases_renewed}",
+            f"pms_worker_partitions_released_total{{{labels}}} {self.partitions_released}",
             f"pms_worker_lease_claim_failures_total{{{labels}}} {self.lease_claim_failures}",
             f"pms_worker_reservations_expired_total{{{labels}}} {self.reservations_expired}",
             f"pms_worker_reservations_cleaned_total{{{labels}}} {self.reservations_expired}",

@@ -23,9 +23,27 @@ variable "cluster_name" {
 }
 
 variable "node_count" {
-  description = "Fixed number of nodes in the node pool (set to 1, 3, or 5 for benchmarking)"
+  description = "Fixed number of nodes when enable_autoscaling is false (set to 1, 3, or 5 for benchmarking)"
   type        = number
   default     = 1
+}
+
+variable "enable_autoscaling" {
+  description = "When true, GKE adjusts node pool size between min_node_count and max_node_count"
+  type        = bool
+  default     = false
+}
+
+variable "min_node_count" {
+  description = "Minimum nodes when enable_autoscaling is true"
+  type        = number
+  default     = 1
+}
+
+variable "max_node_count" {
+  description = "Maximum nodes when enable_autoscaling is true (keep within project vCPU quota)"
+  type        = number
+  default     = 5
 }
 
 variable "machine_type" {

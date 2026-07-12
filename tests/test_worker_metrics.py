@@ -33,10 +33,12 @@ def test_format_prometheus_includes_new_metrics() -> None:
     metrics.record_leases_renewed(3)
     metrics.lease_ops_ms.record(12.5)
     metrics.record_jittered_sleep(437.0)
+    metrics.record_partitions_released(2)
     text = metrics.format_prometheus("worker-test")
     required = [
         "pms_worker_matches_created_total",
         "pms_worker_leases_renewed_total",
+        "pms_worker_partitions_released_total",
         "pms_worker_jittered_sleep_ms",
         "pms_worker_lease_ops_ms_sum",
         "pms_worker_loop_budget_exceeded_total",

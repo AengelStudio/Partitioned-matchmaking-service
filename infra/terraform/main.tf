@@ -34,10 +34,16 @@ resource "google_container_node_pool" "pms_nodes" {
   location = var.zone
   cluster  = google_container_cluster.pms.name
 
-  # Fixed size on purpose: no autoscaling block. Node count is a
-  # manual knob (1 / 3 / 5) for the scalability benchmark, not
-  # something GKE adjusts on its own.
-  node_count = var.node_count
+  # Fixed size for reproducible benchmarks, or autoscaling for elasticity tests.
+  node_count = var.enable_autoscaling ? null : var.node_count
+
+  dynamic "autoscaling" {
+    for_each = var.enable_autoscaling ? [1] : []
+    content {
+      min_node_count = var.min_node_count
+      max_node_count = var.max_node_count
+    }
+  }
 
   node_config {
     machine_type = var.machine_type

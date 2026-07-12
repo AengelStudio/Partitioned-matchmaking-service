@@ -40,6 +40,7 @@ def run_loop(
     with pool.connection() as conn:
         lease_ops_start = time.perf_counter()
         try:
+            leases.record_worker_heartbeat(conn, worker_id)
             renewed = leases.renew_owned_partitions(
                 conn, worker_id, settings.worker_lease_seconds
             )
@@ -51,6 +52,17 @@ def run_loop(
                 settings.matchmaking_partitions,
                 schedule.partition_offset,
             )
+            released = 0
+            if settings.worker_elastic_rebalance_enabled:
+                active_workers = leases.count_active_workers(
+                    conn, settings.worker_heartbeat_seconds
+                )
+                fair_cap = leases.fair_partition_cap(
+                    settings.matchmaking_partitions, active_workers
+                )
+                released = leases.release_excess_partitions(
+                    conn, worker_id, fair_cap
+                )
             conn.commit()
         except Exception:
             conn.rollback()
@@ -60,6 +72,7 @@ def run_loop(
         metrics.lease_ops_ms.record((time.perf_counter() - lease_ops_start) * 1000.0)
         metrics.record_leases_renewed(renewed)
         metrics.record_leases_claimed(len(newly_claimed))
+        metrics.record_partitions_released(released)
 
         expired = matching.cleanup_expired_reservations(conn)
         metrics.record_reservations_expired(expired)
@@ -160,6 +173,7 @@ def shutdown_worker(worker_id: str) -> None:
         pool = get_pool()
         with pool.connection() as conn:
             leases.release_owned_partitions(conn, worker_id)
+            leases.remove_worker_heartbeat(conn, worker_id)
             conn.commit()
     except Exception:
         logger.exception("worker_shutdown_release_failed worker_id=%s", worker_id)
