@@ -23,9 +23,9 @@ Licensed for non-commercial use only — see `[LICENSE](LICENSE)`.
 
 The diagram below shows how PMS is deployed on GKE: external tenants and tooling on the left, stateless compute pods in the upper half of the cluster, and durable storage in the lower half.
 
-PMS architecture diagram
+![PMS architecture diagram](PMS%20Diagram.drawio.png)
 
-Source file: `[PMS diagram.svg](PMS%20diagram.svg)` (editable in [draw.io](https://app.diagrams.net/)).
+Source file: [`PMS Diagram.drawio.png`](PMS%20Diagram.drawio.png) (exported from [draw.io](https://app.diagrams.net/)).
 
 ### Request path (ticket creation)
 
