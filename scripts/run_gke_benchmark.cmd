@@ -5,7 +5,7 @@ REM   scripts\run_gke_benchmark.cmd preflight
 REM   scripts\run_gke_benchmark.cmd 1
 REM   scripts\run_gke_benchmark.cmd 1 skip
 REM   scripts\run_gke_benchmark.cmd 1 skip keep
-REM   scripts\run_gke_benchmark.cmd all skip keep
+REM   scripts\run_gke_benchmark.cmd 5 skip keep fresh
 
 setlocal EnableExtensions
 cd /d "%~dp0.."
@@ -37,6 +37,11 @@ if /i "%~1"=="smoke" (
 )
 if /i "%~1"=="skip" (
   set "PY_ARGS=%PY_ARGS% --skip-build --skip-deploy"
+  shift
+  goto next_arg
+)
+if /i "%~1"=="fresh" (
+  set "PY_ARGS=%PY_ARGS% --reset-postgres"
   shift
   goto next_arg
 )

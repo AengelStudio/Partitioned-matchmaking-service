@@ -75,9 +75,12 @@ class BenchmarkResult:
     p95_latency_ms: float
     matches_before: int
     matches_after: int
+    waiting_tickets_before: int
+    waiting_tickets_after: int
     run_duration_seconds: int
     rejections_by_reason: dict[str, int]
     rejections_by_tenant: dict[str, dict[str, int]]
+    fresh_state: bool
 
 
 class StepTracker:
@@ -324,10 +327,10 @@ def parse_metric_labels(raw: str) -> dict[str, str]:
     return {match.group(1): match.group(2) for match in METRIC_LABEL_KV.finditer(raw)}
 
 
-def parse_rejection_metrics(url: str) -> tuple[dict[str, int], dict[str, dict[str, int]]]:
+def parse_rejection_metrics_text(text: str) -> tuple[dict[str, int], dict[str, dict[str, int]]]:
     by_reason: dict[str, int] = {}
     by_tenant: dict[str, dict[str, int]] = {}
-    for line in fetch_metrics_text(url).splitlines():
+    for line in text.splitlines():
         if line.startswith("#") or not line.strip():
             continue
         match = LABELED_METRIC_LINE.match(line.strip())
@@ -342,6 +345,21 @@ def parse_rejection_metrics(url: str) -> tuple[dict[str, int], dict[str, dict[st
             by_tenant.setdefault(tenant_id, {}).get(reason, 0) + count
         )
     return by_reason, by_tenant
+
+
+def parse_rejection_metrics(url: str) -> tuple[dict[str, int], dict[str, dict[str, int]]]:
+    return parse_rejection_metrics_text(fetch_metrics_text(url))
+
+
+def sum_metric_text(text: str, metric_name: str) -> float:
+    total = 0.0
+    for line in text.splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        match = METRIC_LINE.match(line.strip())
+        if match and match.group("name") == metric_name:
+            total += float(match.group("value"))
+    return total
 
 
 def format_rejection_share(count: int, total: int) -> str:
@@ -409,11 +427,13 @@ def write_results_file(
     lines += ["", "## Raw worker metrics", ""]
     lines += [
         f"- **{r.nodes} node(s):** matches before={r.matches_before}, "
-        f"after={r.matches_after}, delta={r.matches_delta}" for r in rows
+        f"after={r.matches_after}, delta={r.matches_delta}; "
+        f"waiting tickets before={r.waiting_tickets_before}, after={r.waiting_tickets_after}"
+        for r in rows
     ]
     lines += [
         "", "## Admission control rejections", "",
-        "From API `/metrics` after each run (`tickets_rejected_total`).", "",
+        "From API `/metrics` after each run (`tickets_rejected_total`), summed across all API pods.", "",
     ]
     for row in rows:
         total = sum(row.rejections_by_reason.values())
@@ -444,9 +464,12 @@ def write_results_file(
         else:
             lines.append("No admission-control rejections recorded in API metrics.")
         lines.append("")
+    if any(r.fresh_state for r in rows):
+        lines.append("- Postgres PVC reset before run (`--reset-postgres`) for clean ticket/match state.")
     lines += [
         "## Notes", "",
         "- Worker deployment restarted before each run so partition leases redistribute.",
+        "- Worker and API metrics are summed across all pods (not a single service/LB hop).",
         "- Node pool scaled to 0 automatically after the script finished (unless `--skip-teardown`).",
         "- High `rate_limit` (429) counts are expected: `scale_out.js` ramps to 100 VUs while each "
         "tenant is capped at 300 ticket creates/minute (`DEFAULT_TICKET_RATE_LIMIT_PER_MINUTE`).",
@@ -709,12 +732,97 @@ class BenchmarkRunner:
         )
 
     def reset_stateful_store(self, app: str, pvc_name: str, manifest: str) -> None:
-        print(f"  Resetting {app}: PVC pinned to a deleted node", flush=True)
+        print(f"  Resetting {app} (delete PVC {pvc_name})", flush=True)
         run(kubectl("scale", f"statefulset/{app}", "--replicas=0", namespace=self.ns), quiet=True)
         self.wait_stateful_pod_deleted(app)
         run(kubectl("delete", "pvc", pvc_name, "--ignore-not-found", "--wait=true", namespace=self.ns))
         run(kubectl("apply", "-f", manifest))
         run(kubectl("scale", f"statefulset/{app}", "--replicas=1", namespace=self.ns), quiet=True)
+
+    def force_reset_postgres(self) -> None:
+        print("  Forcing Postgres reset for clean benchmark state", flush=True)
+        app, pvc_name, manifest = self.STATEFUL_STORES[0]
+        self.reset_stateful_store(app, pvc_name, manifest)
+        self.wait_for_pods("app=postgres")
+        self.verify_postgres_auth()
+        self.ensure_migration()
+        self.restart_app_deployments()
+        for deployment in ("api", "worker", "callback-dispatcher"):
+            with TaskProgress(f"Rollout {deployment} after postgres reset", 180):
+                run(kubectl(
+                    "rollout", "status", f"deployment/{deployment}", "--timeout=180s",
+                    namespace=self.ns,
+                ), quiet=True)
+
+    def list_ready_pod_names(self, selector: str) -> list[str]:
+        output = run(kubectl(
+            "get", "pods", "-l", selector,
+            "--field-selector=status.phase=Running",
+            "-o", 'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+            namespace=self.ns,
+        ), capture=True, quiet=True, check=False).stdout
+        return [pod for pod in map(str.strip, output.splitlines()) if pod]
+
+    def fetch_pod_metrics_text(self, pod: str, port: int, path: str = "/metrics") -> str:
+        url = f"http://127.0.0.1:{port}{path}"
+        result = run(kubectl(
+            "exec", pod, "--", "python", "-c",
+            "import urllib.request; "
+            f"print(urllib.request.urlopen({url!r}, timeout=15).read().decode())",
+            namespace=self.ns,
+        ), capture=True, quiet=True, check=False)
+        if result.returncode != 0:
+            combined = f"{result.stdout}\n{result.stderr}".strip()
+            raise RuntimeError(f"Failed to fetch metrics from {pod}: {combined[:240]}")
+        return result.stdout
+
+    def sum_metric_across_pods(self, selector: str, port: int, metric_name: str) -> int:
+        pods = self.list_ready_pod_names(selector)
+        if not pods:
+            raise RuntimeError(f"No running pods found for selector {selector!r}")
+        total = 0.0
+        for pod in pods:
+            total += sum_metric_text(self.fetch_pod_metrics_text(pod, port), metric_name)
+        print(
+            f"  {metric_name} across {len(pods)} pod(s) [{selector}]: {int(total)}",
+            flush=True,
+        )
+        return int(total)
+
+    def aggregate_rejection_metrics_across_pods(self) -> tuple[dict[str, int], dict[str, dict[str, int]]]:
+        by_reason: dict[str, int] = {}
+        by_tenant: dict[str, dict[str, int]] = {}
+        pods = self.list_ready_pod_names("app=api")
+        if not pods:
+            raise RuntimeError("No running API pods found for rejection metrics")
+        for pod in pods:
+            pod_reason, pod_tenant = parse_rejection_metrics_text(
+                self.fetch_pod_metrics_text(pod, 8080)
+            )
+            for reason, count in pod_reason.items():
+                by_reason[reason] = by_reason.get(reason, 0) + count
+            for tenant_id, reasons in pod_tenant.items():
+                tenant = by_tenant.setdefault(tenant_id, {})
+                for reason, count in reasons.items():
+                    tenant[reason] = tenant.get(reason, 0) + count
+        print(f"  tickets_rejected_total across {len(pods)} API pod(s)", flush=True)
+        return by_reason, by_tenant
+
+    def query_waiting_tickets(self) -> int:
+        password = self.postgres_password
+        result = run(kubectl(
+            "exec", "statefulset/postgres", "--",
+            "env", f"PGPASSWORD={password}", "psql", "-U", "pms", "-d", "pms", "-tAc",
+            "SELECT COUNT(*) FROM tickets WHERE status = 'waiting';",
+            namespace=self.ns,
+        ), capture=True, quiet=True, check=False)
+        combined = f"{result.stdout}\n{result.stderr}".strip()
+        if result.returncode != 0:
+            raise RuntimeError(f"Waiting-ticket query failed: {combined[:240]}")
+        try:
+            return int(combined.splitlines()[-1].strip())
+        except ValueError as exc:
+            raise RuntimeError(f"Unexpected waiting-ticket query output: {combined[:240]}") from exc
 
     def restart_app_deployments(self) -> None:
         for deployment in ("api", "worker", "callback-dispatcher"):
@@ -901,10 +1009,14 @@ class BenchmarkRunner:
 
     def ensure_deploy(self) -> None:
         a = self.args
+        if a.reset_postgres:
+            self.steps.begin("Reset Postgres for clean benchmark state")
+            self.force_reset_postgres()
         if a.skip_deploy:
             self.steps.begin("Skip deploy (workloads already running)")
             print("  Using existing deployment.", flush=True)
-            self.ensure_stateful_stores()
+            if not a.reset_postgres:
+                self.ensure_stateful_stores()
             return
         password = self.postgres_password
 
@@ -1052,19 +1164,17 @@ class BenchmarkRunner:
             base_url = f"http://{self.apply_ingress()}"
             print(f"  API URL: {base_url}", flush=True)
 
-        metrics_process = self.start_port_forward(
-            "svc/worker-metrics", 9090, 9090, health_path="/metrics",
-        )
-        rejections_by_reason: dict[str, int] = {}
-        rejections_by_tenant: dict[str, dict[str, int]] = {}
+        metrics_process = None
         try:
             self.wait_health(f"{base_url}/health", "Waiting for API /health via ingress", 600)
+            waiting_before = self.query_waiting_tickets()
+            print(f"  Waiting tickets before: {waiting_before}", flush=True)
             try:
-                before = int(sum_metric(
-                    "http://localhost:9090/metrics", "pms_worker_matches_created_total"
-                ))
+                before = self.sum_metric_across_pods(
+                    "app=worker", 9090, "pms_worker_matches_created_total"
+                )
             except Exception as exc:
-                raise RuntimeError(f"Worker metrics not reachable on localhost:9090: {exc}") from exc
+                raise RuntimeError(f"Worker metrics not reachable: {exc}") from exc
             print(f"  Worker matches before: {before}", flush=True)
 
             summary = Path(os.environ.get("TEMP", "/tmp")) / f"pms-k6-summary-{nodes}.json"
@@ -1080,13 +1190,15 @@ class BenchmarkRunner:
             run_with_progress(
                 k6_cmd, "k6 load test", expected_seconds=self.k6_duration + 30,
             )
-            after = int(sum_metric(
-                "http://localhost:9090/metrics", "pms_worker_matches_created_total"
-            ))
+            after = self.sum_metric_across_pods(
+                "app=worker", 9090, "pms_worker_matches_created_total"
+            )
+            waiting_after = self.query_waiting_tickets()
             k6 = parse_k6_summary(summary)
             print(f"  Worker matches after: {after} (delta {after - before})", flush=True)
-            rejections_by_reason, rejections_by_tenant = parse_rejection_metrics(
-                f"{base_url}/metrics"
+            print(f"  Waiting tickets after: {waiting_after}", flush=True)
+            rejections_by_reason, rejections_by_tenant = (
+                self.aggregate_rejection_metrics_across_pods()
             )
             if rejections_by_reason:
                 total_rejected = sum(rejections_by_reason.values())
@@ -1108,7 +1220,9 @@ class BenchmarkRunner:
             round(k6["tickets_rejected"] / self.k6_duration, 2),
             delta, round(delta / self.k6_duration, 2), ratio,
             round(k6["p95_ms"], 2), before, after,
+            waiting_before, waiting_after,
             self.k6_duration, rejections_by_reason, rejections_by_tenant,
+            self.args.reset_postgres,
         )
 
     def write_results(self) -> None:
@@ -1180,6 +1294,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--all", action="store_true", help="Run 1, 3, and 5 node benchmarks")
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--skip-deploy", action="store_true")
+    parser.add_argument(
+        "--reset-postgres",
+        action="store_true",
+        help="Delete and recreate the Postgres PVC before the benchmark for clean ticket/match state",
+    )
     parser.add_argument("--skip-teardown", action="store_true")
     parser.add_argument(
         "--smoke",
