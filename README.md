@@ -332,7 +332,6 @@ To return to fixed-node benchmarks: `terraform apply -var="enable_autoscaling=fa
 - No tenant admin API, tenants are seeded by migrate, not managed at runtime.
 - Per-tenant rate limits cap aggregate ticket throughput, raising `matches_created_per_second` in benchmarks requires multiple concurrent tenants (as `scale_out.js` does) or temporarily higher quotas.
 - Partition fragmentation (many thin queues across tenants/regions) can depress pairing efficiency until enough worker replicas cover distinct partitions.
-- Missing "Delete tickets" functionnality, to be added in future work
 - Single point of failure on for the database
 - Only supports 2 ticket matching
 
